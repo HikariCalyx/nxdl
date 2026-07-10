@@ -1,0 +1,30 @@
+[package]
+name = "nxdl"
+version = "0.1.0"
+edition = "2021"
+description = "A downloader for NXL games"
+license = "MIT"
+
+[[bin]]
+name = "nxdl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["socks-proxy"] }
+sha1 = "0.10"
+base64 = "0.22"
+flate2 = "1"
+hex = "0.4"
+regex = "1"
+indicatif = "0.17"
+
+[profile.release]
+opt-level = 'z'
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = true
