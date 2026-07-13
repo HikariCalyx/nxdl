@@ -65,8 +65,8 @@ fn main() -> Result<()> {
                 let allow_insecure = *allow_insecure;
                 let appid = appid.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "--appid is required for --check and --download\n\
-                         Usage: nxdl nxl --appid <APPID> --check <MANIFEST_URL>"
+                        "--appid is required for --check, --download, and --patch\n\
+                         Usage: nxdl nxl --appid <APPID> --patch <MANIFEST_URL> <TARGET_PATH>"
                     )
                 })?;
                 let resolved = cli::resolve_appid(appid).unwrap_or_else(|| appid.clone());
@@ -416,11 +416,33 @@ fn main() -> Result<()> {
                     }
                     _ => unreachable!(),
                 }
+            } else if let Some(ref pa) = cli.patch {
+                // --patch <MANIFEST_URL> <TARGET_PATH>  (NXL only)
+                if cli::is_ngm(raw_appid) {
+                    bail!("--patch is not supported for NGM games");
+                }
+                let [manifest_source, target] = pa.as_slice() else {
+                    bail!("--patch requires exactly <MANIFEST_URL> <TARGET_PATH>");
+                };
+                let target_path = std::path::PathBuf::from(target);
+                println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
+                println!("  --patch");
+                println!("    manifest_url = {manifest_source}");
+                println!("    target_path  = {}", target_path.display());
+                println!();
+                nxl_patch::patch_client(
+                    manifest_source,
+                    appid_str,
+                    &target_path,
+                    allow_insecure,
+                    proxy,
+                )?;
             } else {
                 println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
                 println!(
-                    "  (no action specified; use --check [MANIFEST_URL] or \
-                     --download <MANIFEST_URL> <TARGET_PATH>)"
+                    "  (no action specified; use --check [MANIFEST_URL], \
+                     --download <MANIFEST_URL> <TARGET_PATH>, or \
+                     --patch <MANIFEST_URL> <TARGET_PATH>)"
                 );
             }
         }

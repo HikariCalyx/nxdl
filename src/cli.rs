@@ -31,6 +31,15 @@ pub struct Cli {
     #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 1..=2)]
     pub download: Option<Vec<String>>,
 
+    /// Patch an NXL client from its current version to a new version.
+    ///
+    /// Takes two values: `<MANIFEST_URL_OR_HASH>` (the target version's
+    /// `.manifest.hash` URL, a 40-character SHA-1 hex hash, or `latest` to
+    /// resolve via the branch API using the login session in `nxl.ini`) and
+    /// `<TARGET_PATH>` (the root client directory).
+    #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 2)]
+    pub patch: Option<Vec<String>>,
+
     /// Check the client size and file count without downloading.
     ///
     /// With a manifest URL: checks an NXL client (existing behaviour).
