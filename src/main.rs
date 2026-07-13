@@ -18,6 +18,54 @@ fn main() -> Result<()> {
     // ---- NGM subcommand ----
     if let Some(ref cmd) = cli.command {
         match cmd {
+            Commands::Nxl {
+                appid,
+                check,
+                download,
+                verbose,
+                filter,
+                filter_regex,
+                invert_filter,
+            } => {
+                let resolved = cli::resolve_appid(appid).unwrap_or_else(|| appid.clone());
+                println!("nxdl nxl: appid = {} (raw: {appid})", resolved);
+
+                // Build filter if provided.
+                let filter = if let Some(ref raw) = filter {
+                    Some(FileFilter::from_substrings(raw, *invert_filter)?)
+                } else if let Some(ref raw) = filter_regex {
+                    Some(FileFilter::from_regexes(raw, *invert_filter)?)
+                } else {
+                    None
+                };
+
+                if let Some(ref manifest_url) = check {
+                    println!("  --check");
+                    println!("    manifest_url = {manifest_url}");
+                    if filter.is_some() {
+                        println!("    filter        = active");
+                    }
+                    println!();
+                    nxl::check_client(manifest_url, &resolved, filter.as_ref(), *verbose > 0)?;
+                } else if let Some(ref dl) = download {
+                    if dl.len() < 2 {
+                        bail!("--download requires <MANIFEST_URL> <TARGET_PATH>");
+                    }
+                    let manifest_url = &dl[0];
+                    let target_path = std::path::PathBuf::from(&dl[1]);
+                    println!("  --download");
+                    println!("    manifest_url = {manifest_url}");
+                    println!("    target_path  = {}", target_path.display());
+                    if filter.is_some() {
+                        println!("    filter        = active");
+                    }
+                    println!();
+                    nxl::download_client(manifest_url, &resolved, &target_path, filter.as_ref())?;
+                } else {
+                    println!("  (no action specified; use --check <MANIFEST_URL> or --download <MANIFEST_URL> <TARGET_PATH>)");
+                }
+                return Ok(());
+            }
             Commands::Ngm {
                 appid,
                 check,

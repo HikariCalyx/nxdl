@@ -9,8 +9,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// The game to download (e.g. "nxl", "gms").
+    /// Target game platform or alias.
     /// When --appid is not provided, the game name is looked up in the alias table.
+    /// Applicable aliases: gms, gms_pts, gms_cw.
     #[arg(value_name = "GAME")]
     pub game: Option<String>,
 
@@ -63,7 +64,44 @@ pub struct Cli {
 /// Subcommands for different game platform operations.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// NGM (Nexon Game Manager) operations.
+    /// NXL operations (download / check NXL clients).
+    Nxl {
+        /// Application ID (a number or alias like "gms").
+        #[arg(long, value_name = "APPID")]
+        appid: String,
+
+        /// Check the client via a manifest URL.
+        #[arg(long, value_name = "MANIFEST_URL")]
+        check: Option<String>,
+
+        /// Download the client using the given manifest URL into the target
+        /// path.
+        #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"])]
+        download: Option<Vec<String>>,
+
+        /// Enable verbose output (lists files with `--check`).
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
+
+        /// Keep only files whose path contains one of the given substrings.
+        ///
+        /// Pass a colon-separated list of conditions, e.g.
+        /// `--filter="Base:Character:Etc"`. Backslashes are treated as
+        /// forward slashes when matching. Cannot be combined with
+        /// `--filter-regex`.
+        #[arg(long, value_name = "COND1[:COND2...]", require_equals = true)]
+        filter: Option<String>,
+
+        /// Keep only files whose path matches one of the given regex patterns.
+        #[arg(long, value_name = "PAT1[:PAT2...]", require_equals = true)]
+        filter_regex: Option<String>,
+
+        /// Invert the filter: keep only files that do NOT match.
+        #[arg(long)]
+        invert_filter: bool,
+    },
+
+    /// NGM operations.
     Ngm {
         /// Application ID (a number or alias like "jms", "kms").
         #[arg(long, value_name = "APPID")]
@@ -132,7 +170,7 @@ const NXL_ALIASES: &[(&str, &str)] = &[
     ("gms_cw", "59822"),
 ];
 
-/// Known appid aliases for NGM (Nexon Game Manager) games (case-insensitive).
+/// Known appid aliases for NGM games (case-insensitive).
 const NGM_ALIASES: &[(&str, &str)] = &[
     ("kms", "589825"),
     ("kmst", "589826"),
