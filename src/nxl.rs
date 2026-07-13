@@ -160,7 +160,7 @@ fn fetch_manifest_hash(url: &str) -> Result<String> {
 
 /// Download, decompress, and parse the real manifest for the given `appid`
 /// using the `hash` obtained from [`fetch_manifest_hash`].
-pub fn fetch_manifest(appid: u32, hash: &str) -> Result<Manifest> {
+pub fn fetch_manifest(appid: &str, hash: &str) -> Result<Manifest> {
     let url = format!("http://download2.nexon.net/Game/nxl/games/{appid}/{hash}");
     let agent = agent();
 
@@ -212,7 +212,7 @@ pub fn decode_file_path(encoded: &str) -> Result<String> {
 
 /// Download and decompress a single object block, returning the uncompressed
 /// bytes.  The SHA-1 of the result must match `expected_sha1`.
-pub fn download_object(agent: &ureq::Agent, appid: u32, object_id: &str) -> Result<Vec<u8>> {
+pub fn download_object(agent: &ureq::Agent, appid: &str, object_id: &str) -> Result<Vec<u8>> {
     let first2 = &object_id[..2];
     let url = format!(
         "http://download2.nexon.net/Game/nxl/games/{appid}/{appid}/{first2}/{object_id}"
@@ -260,7 +260,7 @@ struct ResolvedFile {
 /// are downloaded.
 pub fn download_client(
     manifest_source: &str,
-    appid: u32,
+    appid: &str,
     target_dir: &Path,
     filter: Option<&FileFilter>,
 ) -> Result<()> {
@@ -459,7 +459,7 @@ pub fn download_client(
 /// objects are skipped.
 fn download_one_file(
     agent: &ureq::Agent,
-    appid: u32,
+    appid: &str,
     _rel_path: &str,
     objects: &[String],
     objects_fsize: &[u64],
@@ -685,7 +685,7 @@ fn download_one_file(
 /// verbose listing.
 pub fn check_client(
     manifest_source: &str,
-    appid: u32,
+    appid: &str,
     filter: Option<&FileFilter>,
     verbose: bool,
 ) -> Result<()> {

@@ -1,15 +1,18 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 /// nxdl - a downloader for NXL games.
 #[derive(Parser, Debug)]
 #[command(name = "nxdl", version, about, long_about = None)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
     /// The game to download (e.g. "nxl", "gms").
     /// When --appid is not provided, the game name is looked up in the alias table.
     #[arg(value_name = "GAME")]
-    pub game: String,
+    pub game: Option<String>,
 
     /// The application ID (a number or an alias).
     /// Overrides the game name for appid lookup.
@@ -20,10 +23,13 @@ pub struct Cli {
     #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"])]
     pub download: Option<Vec<String>>,
 
-    /// Check the client size and file count from a manifest URL without
-    /// downloading anything.
-    #[arg(long, value_name = "MANIFEST_URL")]
-    pub check: Option<String>,
+    /// Check the client size and file count without downloading.
+    ///
+    /// With a manifest URL: checks an NXL client (existing behaviour).
+    /// Without a value (flag only): for NGM games (jms, kms, …) fetches
+    /// game info and manifest from the NGM API automatically.
+    #[arg(long, value_name = "MANIFEST_URL", num_args = 0..=1)]
+    pub check: Option<Option<String>>,
 
     /// Enable verbose output.
     ///
@@ -54,6 +60,43 @@ pub struct Cli {
     pub invert_filter: bool,
 }
 
+/// Subcommands for different game platform operations.
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// NGM (Nexon Game Manager) operations.
+    Ngm {
+        /// Application ID (a number or alias like "jms", "kms").
+        #[arg(long, value_name = "APPID")]
+        appid: String,
+
+        /// Check client info via the NGM API (fetches manifest and prints
+        /// summary).
+        #[arg(long)]
+        check: bool,
+
+        /// Enable verbose output (lists files with `--check`).
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
+
+        /// Keep only files whose path contains one of the given substrings.
+        ///
+        /// Pass a colon-separated list of conditions, e.g.
+        /// `--filter="Base:Character:Etc"`. Backslashes are treated as
+        /// forward slashes when matching. Cannot be combined with
+        /// `--filter-regex`.
+        #[arg(long, value_name = "COND1[:COND2...]", require_equals = true)]
+        filter: Option<String>,
+
+        /// Keep only files whose path matches one of the given regex patterns.
+        #[arg(long, value_name = "PAT1[:PAT2...]", require_equals = true)]
+        filter_regex: Option<String>,
+
+        /// Invert the filter: keep only files that do NOT match.
+        #[arg(long)]
+        invert_filter: bool,
+    },
+}
+
 impl Cli {
     /// Convenience: returns `(manifest_url, target_path)` when `--download` is set.
     pub fn download_args(&self) -> Option<(&str, PathBuf)> {
@@ -66,42 +109,83 @@ impl Cli {
         })
     }
 
-    /// Resolve the numeric app ID.
+    /// Resolve the app ID string.
     ///
     /// If `--appid` was provided, it is used (parsed as a number or looked up
     /// as an alias).  Otherwise the `game` positional argument is looked up.
     /// Returns `None` when neither resolves to a known app ID.
-    pub fn resolve_appid(&self) -> Option<u32> {
+    pub fn resolve_appid(&self) -> Option<String> {
         if let Some(ref raw) = self.appid {
             resolve_appid(raw)
+        } else if let Some(ref game) = self.game {
+            resolve_appid(game)
         } else {
-            resolve_appid(&self.game)
+            None
         }
     }
 }
 
-/// Known appid aliases (case-insensitive).
-const ALIASES: &[(&str, u32)] = &[
-    ("gms", 10100),
-    ("gms_pts", 40600),
-    ("gms_cw", 59822),
+/// Known appid aliases for NXL games (case-insensitive).
+const NXL_ALIASES: &[(&str, &str)] = &[
+    ("gms", "10100"),
+    ("gms_pts", "40600"),
+    ("gms_cw", "59822"),
 ];
 
-/// Resolve a raw appid string (number or alias) to a numeric app ID.
+/// Known appid aliases for NGM (Nexon Game Manager) games (case-insensitive).
+const NGM_ALIASES: &[(&str, &str)] = &[
+    ("kms", "589825"),
+    ("kmst", "589826"),
+    ("kms_mac", "589825@ce13"),
+    ("kmst_mac", "589826@7235"),
+    ("jms", "16785939@bb01"),
+    ("kmsm", "106656"),
+    ("msn", "106690@d811"),
+];
+
+/// Resolve a raw appid string (number or alias) to an app ID string.
 ///
-/// Case-insensitive for aliases. Returns `None` when the alias is unknown
-/// or the number fails to parse.
-pub fn resolve_appid(raw: &str) -> Option<u32> {
-    // If it's already a number, parse it directly.
-    if let Ok(id) = raw.parse::<u32>() {
-        return Some(id);
+/// If the input is already a numeric string, it is returned as-is.
+/// Otherwise a case-insensitive alias lookup is performed against both
+/// the NXL and NGM alias tables.
+/// Returns `None` when the alias is unknown.
+pub fn resolve_appid(raw: &str) -> Option<String> {
+    // If it's a pure number, return it directly.
+    if raw.chars().all(|c| c.is_ascii_digit()) {
+        return Some(raw.to_owned());
     }
     // Otherwise, try case-insensitive alias lookup.
     let lower = raw.to_lowercase();
-    for &(alias, id) in ALIASES {
+    for &(alias, id) in NXL_ALIASES {
         if alias == lower {
-            return Some(id);
+            return Some(id.to_owned());
+        }
+    }
+    for &(alias, id) in NGM_ALIASES {
+        if alias == lower {
+            return Some(id.to_owned());
         }
     }
     None
+}
+
+/// Returns `true` if `raw` refers to an NGM (Nexon Game Manager) game.
+///
+/// This is true when:
+/// - `raw` is an NGM alias (e.g. "jms", "kms")
+/// - `raw` already contains `@` (direct NGM appid like "16785939@bb01")
+/// - the *resolved* appid contains `@`
+pub fn is_ngm(raw: &str) -> bool {
+    let lower = raw.to_lowercase();
+    for &(alias, _) in NGM_ALIASES {
+        if alias == lower {
+            return true;
+        }
+    }
+    if let Some(resolved) = resolve_appid(raw) {
+        if resolved.contains('@') {
+            return true;
+        }
+    }
+    raw.contains('@')
 }
