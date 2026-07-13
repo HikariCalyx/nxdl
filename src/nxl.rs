@@ -675,6 +675,30 @@ fn download_one_file(
 // Check (dry-run) mode
 // ---------------------------------------------------------------------------
 
+/// A `Base.wz` entry located in the manifest, ready to have its version read.
+struct BaseWzCandidate {
+    /// Decoded, human-readable path (for reporting).
+    rel_path: String,
+    /// SHA-1 id of the first object block (start of the file).
+    first_object: String,
+    /// Total (uncompressed) file size, used for header validation.
+    fsize: u64,
+}
+
+/// Download the first object block of the given `Base.wz` and read its client
+/// version.
+fn read_base_wz_version(
+    agent: &ureq::Agent,
+    appid: &str,
+    candidate: &BaseWzCandidate,
+) -> Result<crate::miniwzlib::WzVersion> {
+    let data = download_object(agent, appid, &candidate.first_object)
+        .with_context(|| format!("failed to fetch first block of {}", candidate.rel_path))?;
+
+    crate::miniwzlib::get_wz_version_from_bytes(&data, candidate.fsize)
+        .map_err(|e| anyhow!("failed to read version from {}: {e}", candidate.rel_path))
+}
+
 /// Fetch the manifest and print a summary of the client without downloading.
 ///
 /// The `manifest_source` may be either an `http(s)://` URL (`.manifest.hash`)
@@ -707,6 +731,9 @@ pub fn check_client(
     let mut dir_count: usize = 0;
     let mut filtered_out: usize = 0;
     let mut failed_decode: usize = 0;
+    // The client `Base.wz` (root or Data\Base\Base.wz), if present. Detected
+    // across the full manifest, independent of any active filter.
+    let mut base_wz: Option<BaseWzCandidate> = None;
 
     for (encoded_path, file_info) in &manifest.files {
         let rel_path = match decode_file_path(encoded_path) {
@@ -719,6 +746,26 @@ pub fn check_client(
                 continue;
             }
         };
+
+        // Remember the client Base.wz so we can read its version later. Prefer
+        // a Data\Base\Base.wz match (longer path) over a root-level Base.wz.
+        if crate::miniwzlib::is_base_wz(&rel_path)
+            && !(file_info.objects.len() == 1 && file_info.objects[0] == "__DIR__")
+        {
+            let better = match &base_wz {
+                None => true,
+                Some(existing) => rel_path.len() > existing.rel_path.len(),
+            };
+            if better {
+                if let Some(first_object) = file_info.objects.first() {
+                    base_wz = Some(BaseWzCandidate {
+                        rel_path: rel_path.clone(),
+                        first_object: first_object.clone(),
+                        fsize: file_info.fsize,
+                    });
+                }
+            }
+        }
 
         // Directories don't count toward download size.
         if file_info.objects.len() == 1 && file_info.objects[0] == "__DIR__" {
@@ -743,6 +790,22 @@ pub fn check_client(
     let file_count = entries.len();
     let download_bytes: u64 = entries.iter().map(|e| e.1).sum();
 
+    // Read the client version from Base.wz, if the manifest lists it.
+    let client_version: Option<i16> = match &base_wz {
+        Some(candidate) => {
+            let agent = agent();
+            match read_base_wz_version(&agent, appid, candidate) {
+                Ok(v) if v.version != 0 => Some(v.version),
+                Ok(_) => None, // PKG2 / unknown header → no version
+                Err(e) => {
+                    eprintln!("warning: {e}");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
     println!();
     println!("  product:      {appid}");
     println!("  files:        {file_count}");
@@ -751,6 +814,9 @@ pub fn check_client(
         download_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
         bytes = format_bytes(download_bytes),
     );
+    if let Some(ver) = client_version {
+        println!("  client version: v{ver} (from Base.wz)");
+    }
     if filtered_out > 0 || failed_decode > 0 || dir_count > 0 {
         println!(
             "  ({} directories, {} filtered out, {} path errors)",

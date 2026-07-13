@@ -1,5 +1,6 @@
 mod cli;
 mod filter;
+mod miniwzlib;
 mod ngm;
 mod nxl;
 mod resume;

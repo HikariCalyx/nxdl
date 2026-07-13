@@ -251,6 +251,10 @@ struct CheckResult {
     files_in_manifest: usize,
     files_to_download: usize,
     total_size: u64,
+    /// MapleStory client version read from `Base.wz`, when present in the
+    /// manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_version: Option<i16>,
 }
 
 /// Parse an RFC 2822 HTTP date (e.g. "Fri, 03 Jul 2026 03:38:51 GMT") into a
@@ -311,6 +315,70 @@ fn days_from_civil(y: i32, m: u8, d: u8) -> Option<i64> {
     Some(days)
 }
 
+// ---------------------------------------------------------------------------
+// Base.wz version detection
+// ---------------------------------------------------------------------------
+
+/// A `Base.wz` entry located in the manifest, ready to have its version read.
+struct BaseWzCandidate {
+    /// Base64-encoded manifest key (used to build the chunk URL).
+    encoded_path: String,
+    /// Decoded, human-readable path (for reporting).
+    rel_path: String,
+    /// Total (uncompressed) file size, used for header validation.
+    fsize: u64,
+    /// The first chunk: `(chunk_id, chunk_hash)`.
+    first_chunk: (u32, String),
+}
+
+/// Build a [`BaseWzCandidate`] from a manifest entry, picking the
+/// lowest-numbered chunk (chunk 0). Returns `None` if the entry has no usable
+/// chunks (e.g. it is a directory marker).
+fn base_wz_candidate(
+    encoded_path: &str,
+    rel_path: &str,
+    file_info: &NgmManifestFile,
+) -> Option<BaseWzCandidate> {
+    let first_chunk = file_info
+        .objects
+        .iter()
+        .filter_map(|(k, v)| {
+            if v == "__DIR__" {
+                None
+            } else {
+                k.parse::<u32>().ok().map(|id| (id, v.clone()))
+            }
+        })
+        .min_by_key(|(id, _)| *id)?;
+
+    Some(BaseWzCandidate {
+        encoded_path: encoded_path.to_owned(),
+        rel_path: rel_path.to_owned(),
+        fsize: file_info.uncompressed_size,
+        first_chunk,
+    })
+}
+
+/// Download the first chunk of the given `Base.wz` and read its client version.
+fn read_base_wz_version(
+    agent: &ureq::Agent,
+    setup_base: &str,
+    candidate: &BaseWzCandidate,
+) -> Result<crate::miniwzlib::WzVersion> {
+    let (chunk_id, chunk_hash) = &candidate.first_chunk;
+    let data = download_ngm_chunk(
+        agent,
+        setup_base,
+        &candidate.encoded_path,
+        *chunk_id,
+        chunk_hash,
+    )
+    .with_context(|| format!("failed to fetch first chunk of {}", candidate.rel_path))?;
+
+    crate::miniwzlib::get_wz_version_from_bytes(&data, candidate.fsize)
+        .map_err(|e| anyhow!("failed to read version from {}: {e}", candidate.rel_path))
+}
+
 /// Check NGM client info: fetch game info, download the manifest, and print
 /// a summary.  When `verbose` is true, list every file.
 /// When `json` is true, output a single JSON object to stdout.
@@ -345,6 +413,7 @@ pub fn check_ngm(
                     files_in_manifest: 0,
                     files_to_download: 0,
                     total_size: 0,
+                    client_version: None,
                 };
                 println!("{}", serde_json::to_string(&result)?);
             } else {
@@ -379,6 +448,9 @@ pub fn check_ngm(
     let mut dir_count: usize = 0;
     let mut filtered_out: usize = 0;
     let mut failed_decode: usize = 0;
+    // The client `Base.wz` (root or Data\Base\Base.wz), if present. Detected
+    // across the full manifest, independent of any active filter.
+    let mut base_wz: Option<BaseWzCandidate> = None;
 
     for (encoded_path, file_info) in &manifest.files {
         let rel_path = match decode_path(encoded_path) {
@@ -391,6 +463,20 @@ pub fn check_ngm(
                 continue;
             }
         };
+
+        // Remember the client Base.wz so we can read its version later. Prefer
+        // a Data\Base\Base.wz match (longer path) over a root-level Base.wz.
+        if crate::miniwzlib::is_base_wz(&rel_path) {
+            let better = match &base_wz {
+                None => true,
+                Some(existing) => rel_path.len() > existing.rel_path.len(),
+            };
+            if better {
+                if let Some(c) = base_wz_candidate(encoded_path, &rel_path, file_info) {
+                    base_wz = Some(c);
+                }
+            }
+        }
 
         // Directories: 0 objects or a single "__DIR__" marker.
         if file_info.objects.is_empty()
@@ -422,6 +508,21 @@ pub fn check_ngm(
     let file_count = entries.len();
     let download_bytes: u64 = entries.iter().map(|e| e.1).sum();
 
+    // ---- Read the client version from Base.wz, if the manifest lists it ----
+    let client_version: Option<i16> = match &base_wz {
+        Some(candidate) => match read_base_wz_version(&agent, setup_base, candidate) {
+            Ok(v) if v.version != 0 => Some(v.version),
+            Ok(_) => None, // PKG2 / unknown header → no version
+            Err(e) => {
+                if !json {
+                    eprintln!("warning: {e}");
+                }
+                None
+            }
+        },
+        None => None,
+    };
+
     // ---- Step 4: print results ----
     if json {
         let result = CheckResult {
@@ -432,6 +533,7 @@ pub fn check_ngm(
             files_in_manifest: total_in_manifest,
             files_to_download: file_count,
             total_size: download_bytes,
+            client_version,
         };
         println!("{}", serde_json::to_string(&result)?);
     } else {
@@ -445,6 +547,9 @@ pub fn check_ngm(
             download_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             format_bytes(download_bytes),
         );
+        if let Some(ver) = client_version {
+            println!("  client version:      v{ver} (from Base.wz)");
+        }
         if filtered_out > 0 || failed_decode > 0 || dir_count > 0 {
             println!(
                 "  ({} directories, {} filtered out, {} path errors)",
