@@ -42,11 +42,8 @@ const PARALLEL_OBJECTS: usize = 5;
 const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_read(STALL_TIMEOUT)
-        .timeout_connect(CONNECT_TIMEOUT)
-        .build()
+fn agent(allow_insecure: bool, proxy: Option<&str>) -> ureq::Agent {
+    crate::net::agent(allow_insecure, proxy, STALL_TIMEOUT, CONNECT_TIMEOUT)
 }
 
 /// GET a URL and return the response body as a String, retrying on transient
@@ -387,8 +384,10 @@ pub fn check_ngm(
     verbose: bool,
     json: bool,
     filter: Option<&FileFilter>,
+    allow_insecure: bool,
+    proxy: Option<&str>,
 ) -> Result<()> {
-    let agent = agent();
+    let agent = agent(allow_insecure, proxy);
 
     // ---- Step 1: fetch game info ----
     let info_url = format!("https://ngmapi.nexon.com/game-info/{appid}");
@@ -578,8 +577,12 @@ pub fn check_ngm(
 // ---------------------------------------------------------------------------
 
 /// Fetch game info and manifest.  Returns `(GameInfo, NgmManifest, setup_base)`.
-fn fetch_game_and_manifest(appid: &str) -> Result<(GameInfo, NgmManifest, String)> {
-    let agent = agent();
+fn fetch_game_and_manifest(
+    appid: &str,
+    allow_insecure: bool,
+    proxy: Option<&str>,
+) -> Result<(GameInfo, NgmManifest, String)> {
+    let agent = agent(allow_insecure, proxy);
 
     let info_url = format!("https://ngmapi.nexon.com/game-info/{appid}");
     let info_json = http_get_string(&agent, &info_url)
@@ -861,9 +864,11 @@ pub fn download_ngm(
     appid: &str,
     target_dir: &Path,
     filter: Option<&FileFilter>,
+    allow_insecure: bool,
+    proxy: Option<&str>,
 ) -> Result<()> {
     // ---- Step 1 & 2: fetch game info and manifest ----
-    let (info, manifest, setup_base) = fetch_game_and_manifest(appid)?;
+    let (info, manifest, setup_base) = fetch_game_and_manifest(appid, allow_insecure, proxy)?;
     println!("Game:         {}", info.game_name);
     println!("Manifest URL: {setup_base}/{}", info.manifest_name.as_deref().unwrap_or("?"));
     let total_files = manifest.files.len();
@@ -989,7 +994,7 @@ pub fn download_ngm(
     let bytes_downloaded = AtomicU64::new(0);
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    let agent = agent();
+    let agent = agent(allow_insecure, proxy);
 
     std::thread::scope(|scope| {
         let entries = &entries;

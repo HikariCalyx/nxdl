@@ -1,6 +1,7 @@
 mod cli;
 mod filter;
 mod miniwzlib;
+mod net;
 mod ngm;
 mod nxl;
 mod resume;
@@ -35,7 +36,12 @@ fn main() -> Result<()> {
                 filter,
                 filter_regex,
                 invert_filter,
+                proxy,
+                allow_insecure,
             } => {
+                let proxy = net::resolve_proxy(proxy.as_ref());
+                let proxy = proxy.as_deref();
+                let allow_insecure = *allow_insecure;
                 let resolved = cli::resolve_appid(appid).unwrap_or_else(|| appid.clone());
                 println!("nxdl nxl: appid = {} (raw: {appid})", resolved);
 
@@ -55,7 +61,14 @@ fn main() -> Result<()> {
                         println!("    filter        = active");
                     }
                     println!();
-                    nxl::check_client(manifest_url, &resolved, filter.as_ref(), *verbose > 0)?;
+                    nxl::check_client(
+                        manifest_url,
+                        &resolved,
+                        filter.as_ref(),
+                        *verbose > 0,
+                        allow_insecure,
+                        proxy,
+                    )?;
                 } else if let Some(ref dl) = download {
                     if dl.len() < 2 {
                         bail!("--download requires <MANIFEST_URL> <TARGET_PATH>");
@@ -69,7 +82,14 @@ fn main() -> Result<()> {
                         println!("    filter        = active");
                     }
                     println!();
-                    nxl::download_client(manifest_url, &resolved, &target_path, filter.as_ref())?;
+                    nxl::download_client(
+                        manifest_url,
+                        &resolved,
+                        &target_path,
+                        filter.as_ref(),
+                        allow_insecure,
+                        proxy,
+                    )?;
                 } else {
                     println!("  (no action specified; use --check <MANIFEST_URL> or --download <MANIFEST_URL> <TARGET_PATH>)");
                 }
@@ -84,7 +104,12 @@ fn main() -> Result<()> {
                 filter_regex,
                 invert_filter,
                 json,
+                proxy,
+                allow_insecure,
             } => {
+                let proxy = net::resolve_proxy(proxy.as_ref());
+                let proxy = proxy.as_deref();
+                let allow_insecure = *allow_insecure;
                 // Resolve the appid (alias → real id).
                 let resolved = cli::resolve_appid(appid).unwrap_or_else(|| appid.clone());
                 if !*json {
@@ -104,7 +129,14 @@ fn main() -> Result<()> {
                     if !*json {
                         println!();
                     }
-                    ngm::check_ngm(&resolved, *verbose > 0, *json, filter.as_ref())?;
+                    ngm::check_ngm(
+                        &resolved,
+                        *verbose > 0,
+                        *json,
+                        filter.as_ref(),
+                        allow_insecure,
+                        proxy,
+                    )?;
                 } else if let Some(ref target_path) = download {
                     println!("  --download");
                     println!("    target_path  = {}", target_path.display());
@@ -112,7 +144,13 @@ fn main() -> Result<()> {
                         println!("    filter        = active");
                     }
                     println!();
-                    ngm::download_ngm(&resolved, target_path, filter.as_ref())?;
+                    ngm::download_ngm(
+                        &resolved,
+                        target_path,
+                        filter.as_ref(),
+                        allow_insecure,
+                        proxy,
+                    )?;
                 } else {
                     println!("  (no action specified; use --check or --download <TARGET_PATH>)");
                 }
@@ -142,6 +180,11 @@ fn main() -> Result<()> {
         None
     };
 
+    // Resolve networking options (shared by --download and --check).
+    let allow_insecure = cli.allow_insecure;
+    let proxy = net::resolve_proxy(cli.proxy.as_ref());
+    let proxy = proxy.as_deref();
+
     match &cli.check {
         Some(Some(manifest_url)) => {
             // --check <URL>: NXL path (existing behaviour).
@@ -152,7 +195,14 @@ fn main() -> Result<()> {
                 println!("    filter        = active");
             }
             println!();
-            nxl::check_client(manifest_url, appid_str, filter.as_ref(), cli.verbose > 0)?;
+            nxl::check_client(
+                manifest_url,
+                appid_str,
+                filter.as_ref(),
+                cli.verbose > 0,
+                allow_insecure,
+                proxy,
+            )?;
         }
         Some(None) => {
             // --check (flag only): NGM API path.
@@ -170,7 +220,14 @@ fn main() -> Result<()> {
                 }
                 println!();
             }
-            ngm::check_ngm(appid_str, cli.verbose > 0, cli.json, filter.as_ref())?;
+            ngm::check_ngm(
+                appid_str,
+                cli.verbose > 0,
+                cli.json,
+                filter.as_ref(),
+                allow_insecure,
+                proxy,
+            )?;
         }
         None => {
             // --check not provided; try --download or no-op.
@@ -193,6 +250,8 @@ fn main() -> Result<()> {
                             appid_str,
                             &target_path,
                             filter.as_ref(),
+                            allow_insecure,
+                            proxy,
                         )?;
                     }
                     1 => {
@@ -211,7 +270,13 @@ fn main() -> Result<()> {
                             println!("    filter        = active");
                         }
                         println!();
-                        ngm::download_ngm(appid_str, &target_path, filter.as_ref())?;
+                        ngm::download_ngm(
+                            appid_str,
+                            &target_path,
+                            filter.as_ref(),
+                            allow_insecure,
+                            proxy,
+                        )?;
                     }
                     _ => unreachable!(),
                 }

@@ -49,11 +49,8 @@ const PARALLEL_OBJECTS: usize = 5;
 const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_read(STALL_TIMEOUT)
-        .timeout_connect(CONNECT_TIMEOUT)
-        .build()
+fn agent(allow_insecure: bool, proxy: Option<&str>) -> ureq::Agent {
+    crate::net::agent(allow_insecure, proxy, STALL_TIMEOUT, CONNECT_TIMEOUT)
 }
 
 /// GET a URL and return the raw response bytes, retrying on transient errors.
@@ -126,11 +123,11 @@ pub struct ManifestFile {
 ///
 /// If `input` starts with `http://` or `https://` it is treated as a URL to
 /// fetch; otherwise it is returned as-is after trimming whitespace.
-fn resolve_hash(input: &str) -> Result<String> {
+fn resolve_hash(input: &str, allow_insecure: bool, proxy: Option<&str>) -> Result<String> {
     let trimmed = input.trim();
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         println!("Fetching manifest hash from: {trimmed}");
-        let hash = fetch_manifest_hash(trimmed)?;
+        let hash = fetch_manifest_hash(trimmed, allow_insecure, proxy)?;
         println!("Manifest hash: {hash}");
         Ok(hash)
     } else {
@@ -147,8 +144,8 @@ fn resolve_hash(input: &str) -> Result<String> {
 }
 
 /// Fetch a `.manifest.hash` URL and return the plain-text SHA-1 hash inside.
-fn fetch_manifest_hash(url: &str) -> Result<String> {
-    let agent = agent();
+fn fetch_manifest_hash(url: &str, allow_insecure: bool, proxy: Option<&str>) -> Result<String> {
+    let agent = agent(allow_insecure, proxy);
     let bytes = http_get_bytes(&agent, url)
         .context("failed to fetch manifest hash")?;
     let hash = String::from_utf8_lossy(&bytes).trim().to_owned();
@@ -160,9 +157,14 @@ fn fetch_manifest_hash(url: &str) -> Result<String> {
 
 /// Download, decompress, and parse the real manifest for the given `appid`
 /// using the `hash` obtained from [`fetch_manifest_hash`].
-pub fn fetch_manifest(appid: &str, hash: &str) -> Result<Manifest> {
+pub fn fetch_manifest(
+    appid: &str,
+    hash: &str,
+    allow_insecure: bool,
+    proxy: Option<&str>,
+) -> Result<Manifest> {
     let url = format!("http://download2.nexon.net/Game/nxl/games/{appid}/{hash}");
-    let agent = agent();
+    let agent = agent(allow_insecure, proxy);
 
     let compressed = http_get_bytes(&agent, &url)
         .with_context(|| format!("failed to fetch manifest from {url}"))?;
@@ -263,13 +265,28 @@ pub fn download_client(
     appid: &str,
     target_dir: &Path,
     filter: Option<&FileFilter>,
+    allow_insecure: bool,
+    proxy: Option<&str>,
 ) -> Result<()> {
     // Step 1: resolve the manifest hash (URL or raw hex).
-    let hash = resolve_hash(manifest_source)?;
+    let hash = resolve_hash(manifest_source, allow_insecure, proxy)?;
+
+    // Persist the resolved manifest hash to `<target>/patchdata/<appid>.manifest.hash`.
+    let patchdata_dir = target_dir.join("patchdata");
+    std::fs::create_dir_all(&patchdata_dir).with_context(|| {
+        format!("failed to create directory {}", patchdata_dir.display())
+    })?;
+    let hash_path = patchdata_dir.join(format!("{appid}.manifest.hash"));
+    std::fs::write(&hash_path, &hash)
+        .with_context(|| format!("failed to write manifest hash to {}", hash_path.display()))?;
+    println!("Saved manifest hash to: {}", hash_path.display());
+
+    // Game files are written under `<target>/appdata`.
+    let appdata_dir = target_dir.join("appdata");
 
     // Step 2: fetch & parse the manifest.
     println!("Fetching and parsing manifest...");
-    let manifest = fetch_manifest(appid, &hash)?;
+    let manifest = fetch_manifest(appid, &hash, allow_insecure, proxy)?;
     let total_files = manifest.files.len();
     let total_size: u64 = manifest.files.values().map(|f| f.fsize).sum();
     println!(
@@ -303,7 +320,7 @@ pub fn download_client(
 
         // Handle directories eagerly (they're cheap).
         if file_info.objects.len() == 1 && file_info.objects[0] == "__DIR__" {
-            let dir_path = target_dir.join(&rel_path);
+            let dir_path = appdata_dir.join(&rel_path);
             if let Err(e) = std::fs::create_dir_all(&dir_path) {
                 eprintln!("warning: failed to create directory {}: {e}", dir_path.display());
             } else {
@@ -379,7 +396,7 @@ pub fn download_client(
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     // Build a shared agent for all workers.
-    let agent = agent();
+    let agent = agent(allow_insecure, proxy);
 
     std::thread::scope(|scope| {
         let entries = &entries;
@@ -390,6 +407,7 @@ pub fn download_client(
         let failures = &failures;
         let total_pb = &total_pb;
         let agent = &agent;
+        let appdata_dir = &appdata_dir;
 
         for bar in worker_bars.iter().cloned() {
             scope.spawn(move || {
@@ -404,7 +422,7 @@ pub fn download_client(
                     bar.set_position(0);
                     bar.set_message(entry.rel_path.clone());
 
-                    let dest_path = target_dir.join(&entry.rel_path);
+                    let dest_path = appdata_dir.join(&entry.rel_path);
 
                     match download_one_file(
                         agent,
@@ -712,13 +730,15 @@ pub fn check_client(
     appid: &str,
     filter: Option<&FileFilter>,
     verbose: bool,
+    allow_insecure: bool,
+    proxy: Option<&str>,
 ) -> Result<()> {
     // Step 1: resolve the manifest hash (URL or raw hex).
-    let hash = resolve_hash(manifest_source)?;
+    let hash = resolve_hash(manifest_source, allow_insecure, proxy)?;
 
     // Step 2: fetch & parse the manifest.
     println!("Fetching and parsing manifest...");
-    let manifest = fetch_manifest(appid, &hash)?;
+    let manifest = fetch_manifest(appid, &hash, allow_insecure, proxy)?;
     let total_files = manifest.files.len();
     let total_size: u64 = manifest.files.values().map(|f| f.fsize).sum();
     println!(
@@ -793,7 +813,7 @@ pub fn check_client(
     // Read the client version from Base.wz, if the manifest lists it.
     let client_version: Option<i16> = match &base_wz {
         Some(candidate) => {
-            let agent = agent();
+            let agent = agent(allow_insecure, proxy);
             match read_base_wz_version(&agent, appid, candidate) {
                 Ok(v) if v.version != 0 => Some(v.version),
                 Ok(_) => None, // PKG2 / unknown header → no version

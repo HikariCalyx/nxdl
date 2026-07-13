@@ -68,6 +68,23 @@ pub struct Cli {
     /// Output results as JSON (for `--check`).
     #[arg(long)]
     pub json: bool,
+
+    /// Route all traffic through a proxy.
+    ///
+    /// With a value: use that proxy URL (e.g. `--proxy=http://127.0.0.1:8080`
+    /// or `--proxy=socks5://127.0.0.1:1080`). A missing scheme defaults to
+    /// `http://`. With no value (just `--proxy`): use the system-configured
+    /// proxy (the `*_PROXY` environment variables, or Windows Internet
+    /// Settings).
+    #[arg(long, value_name = "PROXY_URL", num_args = 0..=1)]
+    pub proxy: Option<Option<String>>,
+
+    /// Skip TLS certificate verification (unsafe).
+    ///
+    /// Only use this as an escape hatch for environments where the normal
+    /// certificate chain cannot be validated.
+    #[arg(long)]
+    pub allow_insecure: bool,
 }
 
 /// Subcommands for different game platform operations.
@@ -108,6 +125,15 @@ pub enum Commands {
         /// Invert the filter: keep only files that do NOT match.
         #[arg(long)]
         invert_filter: bool,
+
+        /// Route all traffic through a proxy (value optional; empty = system
+        /// proxy). See the top-level `--proxy` help for details.
+        #[arg(long, value_name = "PROXY_URL", num_args = 0..=1)]
+        proxy: Option<Option<String>>,
+
+        /// Skip TLS certificate verification (unsafe).
+        #[arg(long)]
+        allow_insecure: bool,
     },
 
     /// NGM operations.
@@ -149,6 +175,15 @@ pub enum Commands {
         /// Output results as JSON (for `--check`).
         #[arg(long)]
         json: bool,
+
+        /// Route all traffic through a proxy (value optional; empty = system
+        /// proxy). See the top-level `--proxy` help for details.
+        #[arg(long, value_name = "PROXY_URL", num_args = 0..=1)]
+        proxy: Option<Option<String>>,
+
+        /// Skip TLS certificate verification (unsafe).
+        #[arg(long)]
+        allow_insecure: bool,
     },
 }
 
