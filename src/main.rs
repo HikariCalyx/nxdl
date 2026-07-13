@@ -5,6 +5,7 @@ mod miniwzlib;
 mod net;
 mod ngm;
 mod nxl;
+mod nxl_patch;
 mod resume;
 mod taskprogress;
 
@@ -34,6 +35,7 @@ fn main() -> Result<()> {
                 login,
                 check,
                 download,
+                patch: patch_args,
                 verbose,
                 filter,
                 filter_regex,
@@ -155,8 +157,25 @@ fn main() -> Result<()> {
                         allow_insecure,
                         proxy,
                     )?;
+                } else if let Some(ref pa) = patch_args {
+                    let [manifest_source, target]: &[String; 2] = pa
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("--patch requires exactly <MANIFEST_URL> <TARGET_PATH>"))?;
+                    let target_path = std::path::PathBuf::from(target);
+                    println!("  --patch");
+                    println!("    manifest_url = {manifest_source}");
+                    println!("    target_path  = {}", target_path.display());
+                    println!();
+                    nxl_patch::patch_client(
+                        manifest_source,
+                        &resolved,
+                        &target_path,
+                        allow_insecure,
+                        proxy,
+                    )?;
                 } else {
-                    println!("  (no action specified; use --check [MANIFEST_URL], --download <MANIFEST_URL> <TARGET_PATH>, or --login [REGION])");
+                    println!("  (no action specified; use --check [MANIFEST_URL], --download <MANIFEST_URL> <TARGET_PATH>, --patch <MANIFEST_URL> <TARGET_PATH>, or --login [REGION])");
                 }
                 return Ok(());
             }

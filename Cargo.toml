@@ -1,6 +1,6 @@
 [package]
 name = "nxdl"
-version = "0.1.1"
+version = "0.1.2-prerelease1"
 edition = "2021"
 description = "A downloader for NXL games"
 license = "MIT"
@@ -17,6 +17,7 @@ serde_json = "1"
 ureq = { version = "2", features = ["socks-proxy"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 sha1 = "0.10"
+md5 = "0.7"
 base64 = "0.22"
 flate2 = "1"
 hex = "0.4"

@@ -1297,6 +1297,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1387,7 +1393,7 @@ checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "nxdl"
-version = "0.1.1"
+version = "0.1.2-prerelease1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1395,6 +1401,7 @@ dependencies = [
  "flate2",
  "hex",
  "indicatif",
+ "md5",
  "regex",
  "rustls",
  "serde",

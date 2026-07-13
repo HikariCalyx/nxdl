@@ -127,6 +127,24 @@ pub enum Commands {
         #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 1..=2)]
         download: Option<Vec<String>>,
 
+        /// Patch the client from its current version to a new version.
+        ///
+        /// Takes two values: `<MANIFEST_URL_OR_HASH>` (the target version's
+        /// `.manifest.hash` URL, a 40-character SHA-1 hex hash, or the
+        /// special value `latest` to resolve via the branch API using the
+        /// login session in `nxl.ini`) and `<TARGET_PATH>` (the root client
+        /// directory).
+        ///
+        /// The current version hash is read from
+        /// `<TARGET_PATH>/patchdata/<APPID>.manifest.hash`.  Diff files are
+        /// downloaded, applied to the files in `<TARGET_PATH>/appdata/`, and
+        /// the patched output is staged in
+        /// `<TARGET_PATH>/patchdata/patched/`.  Files that cannot be patched
+        /// are re-downloaded from the new manifest.  On success the files are
+        /// moved into `<TARGET_PATH>/appdata/` and the hash file is updated.
+        #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 2)]
+        patch: Option<Vec<String>>,
+
         /// Enable verbose output (lists files with `--check`).
         #[arg(short, long, action = clap::ArgAction::Count)]
         verbose: u8,
