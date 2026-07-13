@@ -248,7 +248,7 @@ struct CheckResult {
     files_in_manifest: usize,
     files_to_download: usize,
     total_size: u64,
-    /// MapleStory client version read from `Base.wz`, when present in the
+    /// Mushroom game client version read from `Base.wz`, when present in the
     /// manifest.
     #[serde(skip_serializing_if = "Option::is_none")]
     client_version: Option<i16>,

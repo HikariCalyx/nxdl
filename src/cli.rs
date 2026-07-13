@@ -11,7 +11,9 @@ pub struct Cli {
 
     /// Target game platform or alias.
     /// When --appid is not provided, the game name is looked up in the alias table.
-    /// Applicable aliases: gms, gms_pts, gms_cw.
+    /// Applicable aliases: 
+    /// gms, gms_pts, gms_cw, gmb, vin_gl,
+    /// jms, msn, jmb, kmb, kmbt, tales_jp.
     #[arg(value_name = "GAME")]
     pub game: Option<String>,
 
@@ -90,19 +92,39 @@ pub struct Cli {
 /// Subcommands for different game platform operations.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// NXL operations (download / check NXL clients).
+    /// NXL operations (download / check NXL clients, account login).
     Nxl {
         /// Application ID (a number or alias like "gms").
+        ///
+        /// Required for `--check` and `--download`, but not for `--login`.
         #[arg(long, value_name = "APPID")]
-        appid: String,
+        appid: Option<String>,
 
-        /// Check the client via a manifest URL.
-        #[arg(long, value_name = "MANIFEST_URL")]
-        check: Option<String>,
+        /// Log in to a Nexon account and store the session in `nxl.ini`.
+        ///
+        /// Opens a WebView dialog pointed at the region's login page. Valid
+        /// regions (case-insensitive): `ww`/`gl`/`worldwide`/`global`,
+        /// `tw`/`taiwan`, `sea`/`southeastasia`, `th`/`thailand`. When no
+        /// region is given, `ww` (global) is used.
+        #[arg(long, value_name = "REGION", num_args = 0..=1)]
+        login: Option<Option<String>>,
 
-        /// Download the client using the given manifest URL into the target
-        /// path.
-        #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"])]
+        /// Check the client.
+        ///
+        /// With a value (a `.manifest.hash` URL or a 40-char SHA-1 hash),
+        /// checks that client. With no value, the public manifest is resolved
+        /// automatically from the branch API using the login session saved in
+        /// `nxl.ini` (run `--login` first).
+        #[arg(long, value_name = "MANIFEST_URL", num_args = 0..=1)]
+        check: Option<Option<String>>,
+
+        /// Download the client into the target path.
+        ///
+        /// With two values (`<MANIFEST_URL> <TARGET_PATH>`), downloads that
+        /// manifest. With one value (`<TARGET_PATH>`), the public manifest is
+        /// resolved automatically from the branch API using the login session
+        /// saved in `nxl.ini` (run `--login` first).
+        #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 1..=2)]
         download: Option<Vec<String>>,
 
         /// Enable verbose output (lists files with `--check`).
@@ -207,16 +229,22 @@ impl Cli {
 /// Known appid aliases for NXL games (case-insensitive).
 const NXL_ALIASES: &[(&str, &str)] = &[
     ("gms", "10100"),
+    ("gmb", "10200"),
+    ("vin_gl", "10300"),
     ("gms_pts", "40600"),
     ("gms_cw", "59822"),
 ];
 
 /// Known appid aliases for NGM games (case-insensitive).
 const NGM_ALIASES: &[(&str, &str)] = &[
+    ("tales_jp", "2528@c829"),
+    ("kmb", "74245@761d"),
+    ("kmbt", "106542@b48c"),
     ("kms", "589825"),
     ("kmst", "589826"),
     ("kms_mac", "589825@ce13"),
     ("kmst_mac", "589826@7235"),
+    ("jmb", "16785925"),
     ("jms", "16785939@bb01"),
     ("kmsm", "106656"),
     ("msn", "106690@d811"),

@@ -31,6 +31,14 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell",
 ] }
 
+# WebView-based interactive login (`nxl --login`). wry uses the OS-native
+# WebView (WebView2 on Windows, WKWebView on macOS), so no extra system
+# libraries are needed on those platforms. Linux is intentionally excluded
+# because it would require webkit2gtk/gtk system packages.
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+wry = "0.55"
+tao = "0.35"
+
 [profile.release]
 opt-level = 'z'
 lto = true
