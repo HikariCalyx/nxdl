@@ -1,0 +1,145 @@
+name: Build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # Native / single-target builds for Windows and Linux.
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            bin: nxdl.exe
+            artifact: nxdl_x86-64-windows.exe
+          - runner: windows-2022
+            target: i686-pc-windows-msvc
+            bin: nxdl.exe
+            artifact: nxdl_i686-windows.exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bin: nxdl.exe
+            artifact: nxdl_aarch64-windows.exe
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin: nxdl
+            artifact: nxdl_x86-64-linux
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: nxdl
+            artifact: nxdl_aarch64-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # `ring` (pulled in via rustls/ureq) needs NASM to assemble its x86/x86_64
+      # routines on Windows. ARM Windows builds do not require it.
+      - name: Install NASM (Windows x86/x86_64)
+        if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'i686-pc-windows-msvc'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage binary
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.artifact }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  # Universal-2 macOS binary (arm64 + x86_64).
+  # Built on the macos-26 image, but `MACOSX_DEPLOYMENT_TARGET` pins the minimum
+  # supported OS to macOS 11 so the binary still runs on macOS 11 and later.
+  macos-universal:
+    name: nxdl_darwin
+    runs-on: macos-26
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (aarch64-apple-darwin)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Build (x86_64-apple-darwin)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Create universal binary with lipo
+        run: |
+          lipo -create -output nxdl_darwin \
+            target/aarch64-apple-darwin/release/nxdl \
+            target/x86_64-apple-darwin/release/nxdl
+          lipo -info nxdl_darwin
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxdl_darwin
+          path: nxdl_darwin
+          if-no-files-found: error
+
+  # Attach all binaries to a GitHub Release when a tag is pushed.
+  release:
+    name: Release
+    needs: [build, macos-universal]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Publish Gitee release
+        if: false # Disabled until creating Gitee repository
+        uses: nicennnnnnnlee/action-gitee-release@master
+        with:
+          gitee_action: create_release
+          gitee_owner: ${{ github.repository_owner }}
+          gitee_repo: ${{ github.event.repository.name }}
+          gitee_token: ${{ secrets.GITEE_TOKEN }}
+          gitee_tag_name: ${{ github.ref_name }}
+          gitee_release_name: ${{ github.ref_name }}
+          gitee_target_commitish: master
+          gitee_release_body: 'nxdl release mirror of this version: ${{ github.ref_name }}'
+          gitee_upload_retry_times: 3
+          gitee_files: |
+            artifacts/*
