@@ -477,7 +477,7 @@ fn download_one_file(
     }
 
     let num_objects = objects.len();
-    let progress_path = crate::resume::progress_path(dest_path);
+    let progress_path = crate::resume::progress_path(dest_path, &crate::resume::SIDECAR_NXL);
 
     // Compute cumulative byte offsets for each object.
     let offsets: Vec<u64> = std::iter::once(0)
@@ -490,7 +490,7 @@ fn download_one_file(
 
     // --- Check for a resumable sidecar ---
     let completed_mask: Vec<bool> = if let Some((bitmap, saved_objects, saved_size)) =
-        crate::resume::read_progress(&progress_path)
+        crate::resume::read_progress(&progress_path, &crate::resume::SIDECAR_NXL)
     {
         if saved_objects as usize == num_objects
             && saved_size == total_fsize
@@ -520,7 +520,7 @@ fn download_one_file(
                 "discarding stale sidecar {} (manifest changed?)",
                 progress_path.display(),
             );
-            crate::resume::delete_progress(dest_path);
+            crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
             let _ = std::fs::remove_file(dest_path);
             vec![false; num_objects]
         }
@@ -543,7 +543,7 @@ fn download_one_file(
             .with_context(|| format!("failed to create {}", dest_path.display()))?;
         file.set_len(total_fsize)
             .with_context(|| format!("failed to size file {}", dest_path.display()))?;
-        crate::resume::create_progress(dest_path, num_objects as u32, total_fsize)
+        crate::resume::create_progress(dest_path, num_objects as u32, total_fsize, &crate::resume::SIDECAR_NXL)
             .with_context(|| format!("failed to create sidecar {}", progress_path.display()))?;
     }
 
@@ -554,7 +554,7 @@ fn download_one_file(
 
     if pending.is_empty() {
         // All objects already done — just clean up.
-        crate::resume::delete_progress(dest_path);
+        crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
         return Ok(());
     }
 
@@ -570,7 +570,7 @@ fn download_one_file(
         }
         std::fs::write(dest_path, &data)
             .with_context(|| format!("failed to write {}", dest_path.display()))?;
-        crate::resume::delete_progress(dest_path);
+        crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
         worker_bar.inc(total_fsize);
         total_bar.inc(total_fsize);
         return Ok(());
@@ -633,7 +633,7 @@ fn download_one_file(
                             }
 
                             // Mark this object as done in the sidecar.
-                            if let Err(e) = crate::resume::mark_done(dest_path, i as u32) {
+                            if let Err(e) = crate::resume::mark_done(dest_path, i as u32, &crate::resume::SIDECAR_NXL) {
                                 object_failed.fetch_add(1, Ordering::Relaxed);
                                 first_err
                                     .lock()
@@ -666,7 +666,7 @@ fn download_one_file(
     }
 
     // All objects downloaded — clean up the sidecar.
-    crate::resume::delete_progress(dest_path);
+    crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
 
     Ok(())
 }

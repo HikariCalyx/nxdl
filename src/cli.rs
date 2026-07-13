@@ -20,8 +20,13 @@ pub struct Cli {
     #[arg(long, value_name = "APPID")]
     pub appid: Option<String>,
 
-    /// Download the client using the given manifest URL into the target path.
-    #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"])]
+    /// Download the client.
+    ///
+    /// With two values: downloads an NXL client from a manifest URL into
+    /// the target path.
+    /// With one value (NGM games only): downloads the client into the
+    /// target path using the NGM API.
+    #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 1..=2)]
     pub download: Option<Vec<String>>,
 
     /// Check the client size and file count without downloading.
@@ -59,6 +64,10 @@ pub struct Cli {
     /// Can be used together with `--filter` or `--filter-regex`.
     #[arg(long)]
     pub invert_filter: bool,
+
+    /// Output results as JSON (for `--check`).
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Subcommands for different game platform operations.
@@ -112,6 +121,10 @@ pub enum Commands {
         #[arg(long)]
         check: bool,
 
+        /// Download the client into the target path using the NGM API.
+        #[arg(long, value_name = "TARGET_PATH")]
+        download: Option<PathBuf>,
+
         /// Enable verbose output (lists files with `--check`).
         #[arg(short, long, action = clap::ArgAction::Count)]
         verbose: u8,
@@ -132,21 +145,14 @@ pub enum Commands {
         /// Invert the filter: keep only files that do NOT match.
         #[arg(long)]
         invert_filter: bool,
+
+        /// Output results as JSON (for `--check`).
+        #[arg(long)]
+        json: bool,
     },
 }
 
 impl Cli {
-    /// Convenience: returns `(manifest_url, target_path)` when `--download` is set.
-    pub fn download_args(&self) -> Option<(&str, PathBuf)> {
-        self.download.as_ref().and_then(|v| {
-            if v.len() >= 2 {
-                Some((v[0].as_str(), PathBuf::from(&v[1])))
-            } else {
-                None
-            }
-        })
-    }
-
     /// Resolve the app ID string.
     ///
     /// If `--appid` was provided, it is used (parsed as a number or looked up

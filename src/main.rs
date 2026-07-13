@@ -13,7 +13,14 @@ use filter::FileFilter;
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    println!("nxdl v{}", env!("CARGO_PKG_VERSION"));
+    // In JSON mode, suppress the version banner (output is machine-readable).
+    let json_mode = cli.json
+        || cli.command.as_ref().map_or(false, |c| {
+            matches!(c, Commands::Ngm { json: true, .. })
+        });
+    if !json_mode {
+        println!("nxdl v{}", env!("CARGO_PKG_VERSION"));
+    }
 
     // ---- NGM subcommand ----
     if let Some(ref cmd) = cli.command {
@@ -69,28 +76,43 @@ fn main() -> Result<()> {
             Commands::Ngm {
                 appid,
                 check,
+                download,
                 verbose,
                 filter,
                 filter_regex,
                 invert_filter,
+                json,
             } => {
                 // Resolve the appid (alias → real id).
                 let resolved = cli::resolve_appid(appid).unwrap_or_else(|| appid.clone());
-                println!("nxdl ngm: appid = {} (raw: {appid})", resolved);
+                if !*json {
+                    println!("nxdl ngm: appid = {} (raw: {appid})", resolved);
+                }
+
+                // Build filter if provided.
+                let filter = if let Some(ref raw) = filter {
+                    Some(FileFilter::from_substrings(raw, *invert_filter)?)
+                } else if let Some(ref raw) = filter_regex {
+                    Some(FileFilter::from_regexes(raw, *invert_filter)?)
+                } else {
+                    None
+                };
 
                 if *check {
-                    // Build filter if provided.
-                    let filter = if let Some(ref raw) = filter {
-                        Some(FileFilter::from_substrings(raw, *invert_filter)?)
-                    } else if let Some(ref raw) = filter_regex {
-                        Some(FileFilter::from_regexes(raw, *invert_filter)?)
-                    } else {
-                        None
-                    };
+                    if !*json {
+                        println!();
+                    }
+                    ngm::check_ngm(&resolved, *verbose > 0, *json, filter.as_ref())?;
+                } else if let Some(ref target_path) = download {
+                    println!("  --download");
+                    println!("    target_path  = {}", target_path.display());
+                    if filter.is_some() {
+                        println!("    filter        = active");
+                    }
                     println!();
-                    ngm::check_ngm(&resolved, *verbose > 0, filter.as_ref())?;
+                    ngm::download_ngm(&resolved, target_path, filter.as_ref())?;
                 } else {
-                    println!("  (no action specified; use --check)");
+                    println!("  (no action specified; use --check or --download <TARGET_PATH>)");
                 }
                 return Ok(());
             }
@@ -138,31 +160,59 @@ fn main() -> Result<()> {
                      Usage: nxdl {raw_appid} --check <MANIFEST_URL>"
                 );
             }
-            println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
-            println!("  --check (NGM)");
-            if filter.is_some() {
-                println!("    filter        = active");
-            }
-            println!();
-            ngm::check_ngm(appid_str, cli.verbose > 0, filter.as_ref())?;
-        }
-        None => {
-            // --check not provided; try --download or no-op.
-            if let Some((manifest_url, target_path)) = cli.download_args() {
+            if !cli.json {
                 println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
-                println!("  --download");
-                println!("    manifest_url = {manifest_url}");
-                println!("    target_path  = {}", target_path.display());
+                println!("  --check (NGM)");
                 if filter.is_some() {
                     println!("    filter        = active");
                 }
                 println!();
-                nxl::download_client(
-                    manifest_url,
-                    appid_str,
-                    &target_path,
-                    filter.as_ref(),
-                )?;
+            }
+            ngm::check_ngm(appid_str, cli.verbose > 0, cli.json, filter.as_ref())?;
+        }
+        None => {
+            // --check not provided; try --download or no-op.
+            if let Some(ref dl) = cli.download {
+                match dl.len() {
+                    2 => {
+                        // NXL download: <MANIFEST_URL> <TARGET_PATH>
+                        let manifest_url = &dl[0];
+                        let target_path = std::path::PathBuf::from(&dl[1]);
+                        println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
+                        println!("  --download");
+                        println!("    manifest_url = {manifest_url}");
+                        println!("    target_path  = {}", target_path.display());
+                        if filter.is_some() {
+                            println!("    filter        = active");
+                        }
+                        println!();
+                        nxl::download_client(
+                            manifest_url,
+                            appid_str,
+                            &target_path,
+                            filter.as_ref(),
+                        )?;
+                    }
+                    1 => {
+                        // NGM download: <TARGET_PATH> (NGM game only)
+                        if !cli::is_ngm(raw_appid) {
+                            bail!(
+                                "--download requires a manifest URL for NXL games.\n\
+                                 Usage: nxdl {raw_appid} --download <MANIFEST_URL> <TARGET_PATH>"
+                            );
+                        }
+                        let target_path = std::path::PathBuf::from(&dl[0]);
+                        println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
+                        println!("  --download (NGM)");
+                        println!("    target_path  = {}", target_path.display());
+                        if filter.is_some() {
+                            println!("    filter        = active");
+                        }
+                        println!();
+                        ngm::download_ngm(appid_str, &target_path, filter.as_ref())?;
+                    }
+                    _ => unreachable!(),
+                }
             } else {
                 println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
                 println!(
