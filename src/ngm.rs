@@ -587,18 +587,19 @@ fn download_ngm_one_file(
                 && dest_path.exists()
                 && dest_path.metadata().map_or(false, |m| m.len() == total_fsize)
             {
-                eprintln!(
-                    "resuming {} ({}/{} objects already done)",
-                    progress_path.display(),
-                    bitmap.iter().filter(|&&b| b != 0).count(),
-                    num_objects,
-                );
+                let done = bitmap.iter().filter(|&&b| b != 0).count();
+                if done > 0 {
+                    worker_bar.println(format!(
+                        "resuming {} ({done}/{num_objects} objects already done)",
+                        progress_path.display(),
+                    ));
+                }
                 bitmap.iter().map(|&b| b != 0).collect()
             } else {
-                eprintln!(
+                worker_bar.println(format!(
                     "discarding stale sidecar {}",
                     progress_path.display(),
-                );
+                ));
                 crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NGM);
                 let _ = std::fs::remove_file(dest_path);
                 vec![false; num_objects]
@@ -634,13 +635,6 @@ fn download_ngm_one_file(
     // --- Multi-chunk path ---
     // Pre-allocate the destination file and create sidecar on first run.
     if !is_resuming {
-        if num_objects > 1 {
-            eprintln!(
-                "creating sidecar {} ({} objects)",
-                progress_path.display(),
-                num_objects,
-            );
-        }
         let file = std::fs::File::create(dest_path)
             .with_context(|| format!("failed to create {}", dest_path.display()))?;
         file.set_len(total_fsize)
@@ -844,7 +838,12 @@ pub fn download_ngm(
     }
 
     // ---- Progress bars ----
+    // One overall bar plus one reusable bar per worker (mirrors cmsdl). Each
+    // worker keeps a single bar for its whole lifetime and only clears it once
+    // it has finished all its files, which avoids the flicker/smearing caused
+    // by clearing and reviving a bar on every file.
     let mp = MultiProgress::new();
+    // Hide bars when stdout is not a terminal (piped / redirected).
     if !std::io::stdout().is_terminal() {
         mp.set_draw_target(ProgressDrawTarget::hidden());
     }
@@ -858,6 +857,9 @@ pub fn download_ngm(
         .progress_chars("=>-"),
     );
     total_pb.enable_steady_tick(Duration::from_millis(120));
+
+    // Reflect overall progress on the OS taskbar / dock (cleared on drop).
+    let mut _taskbar = crate::taskprogress::watch(total_pb.clone(), download_bytes);
 
     let worker_bars: Vec<ProgressBar> = (0..PARALLEL_FILES.min(file_count))
         .map(|_| {
@@ -930,14 +932,14 @@ pub fn download_ngm(
                                 .push(format!("{}: {:#}", entry.rel_path, e));
                         }
                     }
-
-                    bar.finish_and_clear();
                 }
+                bar.finish_and_clear();
             });
         }
     });
 
     total_pb.finish_and_clear();
+    _taskbar.finish();
 
     let downloaded = downloaded.load(Ordering::Relaxed);
     let failed = failed_count.load(Ordering::Relaxed);

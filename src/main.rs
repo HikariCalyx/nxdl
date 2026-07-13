@@ -3,6 +3,7 @@ mod filter;
 mod ngm;
 mod nxl;
 mod resume;
+mod taskprogress;
 
 use anyhow::{bail, Result};
 use clap::Parser;

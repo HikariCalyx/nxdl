@@ -332,6 +332,10 @@ pub fn download_client(
     }
 
     // ---- Progress bars ----
+    // One overall bar plus one reusable bar per worker (mirrors cmsdl). Each
+    // worker keeps a single bar for its whole lifetime and only clears it once
+    // it has finished all its files, which avoids the flicker/smearing caused
+    // by clearing and reviving a bar on every file.
     let mp = MultiProgress::new();
     // Hide bars when stdout is not a terminal (piped / redirected).
     if !std::io::stdout().is_terminal() {
@@ -347,6 +351,9 @@ pub fn download_client(
         .progress_chars("=>-"),
     );
     total_pb.enable_steady_tick(Duration::from_millis(120));
+
+    // Reflect overall progress on the OS taskbar / dock (cleared on drop).
+    let mut _taskbar = crate::taskprogress::watch(total_pb.clone(), download_bytes);
 
     let worker_bars: Vec<ProgressBar> = (0..PARALLEL_FILES.min(file_count))
         .map(|_| {
@@ -419,14 +426,14 @@ pub fn download_client(
                             failures.lock().unwrap().push(format!("{}: {:#}", entry.rel_path, e));
                         }
                     }
-
-                    bar.finish_and_clear();
                 }
+                bar.finish_and_clear();
             });
         }
     });
 
     total_pb.finish_and_clear();
+    _taskbar.finish();
 
     let downloaded = downloaded.load(Ordering::Relaxed);
     let failed = failed_count.load(Ordering::Relaxed);
@@ -505,21 +512,21 @@ fn download_one_file(
                 .map(|(i, _)| objects_fsize.get(i).copied().unwrap_or(0))
                 .sum();
             let done_count = bitmap.iter().filter(|&&b| b != 0).count();
-            eprintln!(
-                "resuming {} ({}/{} objects already done)",
-                progress_path.display(),
-                done_count,
-                num_objects,
-            );
+            if done_count > 0 {
+                worker_bar.println(format!(
+                    "resuming {} ({done_count}/{num_objects} objects already done)",
+                    progress_path.display(),
+                ));
+            }
             worker_bar.inc(already_done);
             total_bar.inc(already_done);
             bitmap.iter().map(|&b| b != 0).collect()
         } else {
             // Sidecar is stale (manifest changed?) — discard it.
-            eprintln!(
+            worker_bar.println(format!(
                 "discarding stale sidecar {} (manifest changed?)",
                 progress_path.display(),
-            );
+            ));
             crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
             let _ = std::fs::remove_file(dest_path);
             vec![false; num_objects]
@@ -532,13 +539,6 @@ fn download_one_file(
 
     // --- Pre-allocate / open the destination file ---
     if !is_resuming {
-        if num_objects > 1 {
-            eprintln!(
-                "creating sidecar {} ({} objects)",
-                progress_path.display(),
-                num_objects,
-            );
-        }
         let file = std::fs::File::create(dest_path)
             .with_context(|| format!("failed to create {}", dest_path.display()))?;
         file.set_len(total_fsize)
