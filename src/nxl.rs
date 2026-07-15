@@ -8,12 +8,14 @@
 //! 1. Obtain a `.manifest.hash` URL (requires Nexon authentication; **skipped** —
 //!    the caller supplies this URL directly).
 //! 2. Fetch that URL → a plain-text SHA-1 hash string.
-//! 3. Construct the real manifest URL:
-//!    `http://download2.nexon.net/Game/nxl/games/{appid}/{hash}`
+//! 3. Construct the real manifest URL from the CDN base directory (extracted
+//!    from the `.manifest.hash` URL, or defaulting to
+//!    `http://download2.nexon.net/Game/nxl/games/{appid}`):
+//!    `{base_url}/{hash}`
 //! 4. Download & decompress (zlib / raw deflate) → a JSON manifest.
 //! 5. Parse the manifest: file paths are Base64-encoded UTF-16LE with a BOM.
 //! 6. For each file, download its object blocks:
-//!    `http://download2.nexon.net/Game/nxl/games/{appid}/{appid}/{first2chars}/{sha1}`
+//!    `{base_url}/{appid}/{first2chars}/{sha1}`
 //! 7. Decompress each block, validate SHA-1, concatenate into the final file.
 
 use std::collections::HashMap;
@@ -118,18 +120,51 @@ pub struct ManifestFile {
 // Manifest fetching & parsing
 // ---------------------------------------------------------------------------
 
+/// A resolved manifest hash paired with the CDN base URL to use for all
+/// subsequent manifest and object downloads.
+pub struct ResolvedHash {
+    pub hash: String,
+    /// Base URL constructed from the `.manifest.hash` URL (everything before
+    /// the last `/`), or the default `download2.nexon.net` URL when only a raw
+    /// hash was supplied.
+    ///
+    /// Examples:
+    /// - `http://download2.nexon.net/Game/nxl/games/10100`
+    /// - `https://twheroes.arenadownload.nexon.com/50220`
+    pub base_url: String,
+}
+
+/// Extract the CDN base directory from a `.manifest.hash` URL by stripping
+/// the filename (everything after the last `/`).
+fn base_url_from_hash_url(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    match url.rfind('/') {
+        Some(pos) => url[..pos].to_owned(),
+        None => url.to_owned(),
+    }
+}
+
+/// Default CDN base URL for games hosted on `download2.nexon.net`.
+fn default_base_url(appid: &str) -> String {
+    format!("http://download2.nexon.net/Game/nxl/games/{appid}")
+}
+
 /// Resolve a manifest hash from either a `.manifest.hash` URL or a raw SHA-1
 /// hex string.
 ///
 /// If `input` starts with `http://` or `https://` it is treated as a URL to
-/// fetch; otherwise it is returned as-is after trimming whitespace.
-fn resolve_hash(input: &str, allow_insecure: bool, proxy: Option<&str>) -> Result<String> {
+/// fetch; the base URL is extracted from that URL.  Otherwise the input is
+/// validated as a raw 40-character hex hash and the default
+/// `download2.nexon.net` base URL is used.
+fn resolve_hash(input: &str, allow_insecure: bool, proxy: Option<&str>, appid: &str) -> Result<ResolvedHash> {
     let trimmed = input.trim();
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         println!("Fetching manifest hash from: {trimmed}");
         let hash = fetch_manifest_hash(trimmed, allow_insecure, proxy)?;
+        let base_url = base_url_from_hash_url(trimmed);
         println!("Manifest hash: {hash}");
-        Ok(hash)
+        println!("CDN base URL:   {base_url}");
+        Ok(ResolvedHash { hash, base_url })
     } else {
         let hash = trimmed.to_owned();
         if hash.len() != 40 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -138,8 +173,10 @@ fn resolve_hash(input: &str, allow_insecure: bool, proxy: Option<&str>) -> Resul
                 hash
             );
         }
+        let base_url = default_base_url(appid);
         println!("Using manifest hash: {hash}");
-        Ok(hash)
+        println!("CDN base URL:       {base_url}");
+        Ok(ResolvedHash { hash, base_url })
     }
 }
 
@@ -155,15 +192,15 @@ fn fetch_manifest_hash(url: &str, allow_insecure: bool, proxy: Option<&str>) -> 
     Ok(hash)
 }
 
-/// Download, decompress, and parse the real manifest for the given `appid`
-/// using the `hash` obtained from [`fetch_manifest_hash`].
+/// Download, decompress, and parse the real manifest from the given CDN base
+/// URL using the `hash` obtained from [`fetch_manifest_hash`].
 pub fn fetch_manifest(
-    appid: &str,
+    base_url: &str,
     hash: &str,
     allow_insecure: bool,
     proxy: Option<&str>,
 ) -> Result<Manifest> {
-    let url = format!("http://download2.nexon.net/Game/nxl/games/{appid}/{hash}");
+    let url = format!("{base_url}/{hash}");
     let agent = agent(allow_insecure, proxy);
 
     let compressed = http_get_bytes(&agent, &url)
@@ -214,10 +251,10 @@ pub fn decode_file_path(encoded: &str) -> Result<String> {
 
 /// Download and decompress a single object block, returning the uncompressed
 /// bytes.  The SHA-1 of the result must match `expected_sha1`.
-pub fn download_object(agent: &ureq::Agent, appid: &str, object_id: &str) -> Result<Vec<u8>> {
+pub fn download_object(agent: &ureq::Agent, base_url: &str, appid: &str, object_id: &str) -> Result<Vec<u8>> {
     let first2 = &object_id[..2];
     let url = format!(
-        "http://download2.nexon.net/Game/nxl/games/{appid}/{appid}/{first2}/{object_id}"
+        "{base_url}/{appid}/{first2}/{object_id}"
     );
 
     let compressed = http_get_bytes(agent, &url)
@@ -269,7 +306,9 @@ pub fn download_client(
     proxy: Option<&str>,
 ) -> Result<()> {
     // Step 1: resolve the manifest hash (URL or raw hex).
-    let hash = resolve_hash(manifest_source, allow_insecure, proxy)?;
+    let resolved = resolve_hash(manifest_source, allow_insecure, proxy, appid)?;
+    let hash = &resolved.hash;
+    let base_url = &resolved.base_url;
 
     // Persist the resolved manifest hash to `<target>/patchdata/<appid>.manifest.hash`.
     let patchdata_dir = target_dir.join("patchdata");
@@ -277,7 +316,7 @@ pub fn download_client(
         format!("failed to create directory {}", patchdata_dir.display())
     })?;
     let hash_path = patchdata_dir.join(format!("{appid}.manifest.hash"));
-    std::fs::write(&hash_path, &hash)
+    std::fs::write(&hash_path, hash)
         .with_context(|| format!("failed to write manifest hash to {}", hash_path.display()))?;
     println!("Saved manifest hash to: {}", hash_path.display());
 
@@ -286,7 +325,7 @@ pub fn download_client(
 
     // Step 2: fetch & parse the manifest.
     println!("Fetching and parsing manifest...");
-    let manifest = fetch_manifest(appid, &hash, allow_insecure, proxy)?;
+    let manifest = fetch_manifest(base_url, hash, allow_insecure, proxy)?;
     let total_files = manifest.files.len();
     let total_size: u64 = manifest.files.values().map(|f| f.fsize).sum();
     println!(
@@ -408,6 +447,7 @@ pub fn download_client(
         let total_pb = &total_pb;
         let agent = &agent;
         let appdata_dir = &appdata_dir;
+        let base_url = base_url.as_str();
 
         for bar in worker_bars.iter().cloned() {
             scope.spawn(move || {
@@ -426,6 +466,7 @@ pub fn download_client(
 
                     match download_one_file(
                         agent,
+                        base_url,
                         appid,
                         &entry.rel_path,
                         &entry.objects,
@@ -484,6 +525,7 @@ pub fn download_client(
 /// objects are skipped.
 fn download_one_file(
     agent: &ureq::Agent,
+    base_url: &str,
     appid: &str,
     _rel_path: &str,
     objects: &[String],
@@ -578,7 +620,7 @@ fn download_one_file(
 
     if num_objects == 1 && !is_resuming {
         // Fast path: single object, no resume — download directly.
-        let data = download_object(agent, appid, &objects[0])?;
+        let data = download_object(agent, base_url, appid, &objects[0])?;
         let expected = objects_fsize.first().copied().unwrap_or(0);
         if data.len() as u64 != expected {
             bail!(
@@ -615,7 +657,7 @@ fn download_one_file(
                     let object_id = &objects[i];
                     let expected_size = objects_fsize.get(i).copied().unwrap_or(0);
 
-                    match download_object(agent, appid, object_id) {
+                    match download_object(agent, base_url, appid, object_id) {
                         Ok(data) => {
                             if data.len() as u64 != expected_size {
                                 let e = anyhow!(
@@ -707,10 +749,11 @@ struct BaseWzCandidate {
 /// version.
 fn read_base_wz_version(
     agent: &ureq::Agent,
+    base_url: &str,
     appid: &str,
     candidate: &BaseWzCandidate,
 ) -> Result<crate::miniwzlib::WzVersion> {
-    let data = download_object(agent, appid, &candidate.first_object)
+    let data = download_object(agent, base_url, appid, &candidate.first_object)
         .with_context(|| format!("failed to fetch first block of {}", candidate.rel_path))?;
 
     crate::miniwzlib::get_wz_version_from_bytes(&data, candidate.fsize)
@@ -734,11 +777,13 @@ pub fn check_client(
     proxy: Option<&str>,
 ) -> Result<()> {
     // Step 1: resolve the manifest hash (URL or raw hex).
-    let hash = resolve_hash(manifest_source, allow_insecure, proxy)?;
+    let resolved = resolve_hash(manifest_source, allow_insecure, proxy, appid)?;
+    let hash = &resolved.hash;
+    let base_url = &resolved.base_url;
 
     // Step 2: fetch & parse the manifest.
     println!("Fetching and parsing manifest...");
-    let manifest = fetch_manifest(appid, &hash, allow_insecure, proxy)?;
+    let manifest = fetch_manifest(base_url, hash, allow_insecure, proxy)?;
     let total_files = manifest.files.len();
     let total_size: u64 = manifest.files.values().map(|f| f.fsize).sum();
     println!(
@@ -814,7 +859,7 @@ pub fn check_client(
     let client_version: Option<i16> = match &base_wz {
         Some(candidate) => {
             let agent = agent(allow_insecure, proxy);
-            match read_base_wz_version(&agent, appid, candidate) {
+            match read_base_wz_version(&agent, base_url, appid, candidate) {
                 Ok(v) if v.version != 0 => Some(v.version),
                 Ok(_) => None, // PKG2 / unknown header → no version
                 Err(e) => {

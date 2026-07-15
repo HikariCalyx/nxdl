@@ -55,7 +55,6 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 // ---------------------------------------------------------------------------
 
 const PARALLEL_PATCHES: usize = 10;
-const BASE_CDN: &str = "http://download2.nexon.net/Game/nxl/games";
 const STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -129,14 +128,15 @@ pub struct DiffEntry {
 /// - `"latest"` (case-insensitive): resolve via the branch API using the login
 ///   session stored in `nxl.ini` (same flow as `nxdl nxl --download <TARGET_PATH>`).
 /// - An `http(s)://` URL pointing to a `.manifest.hash` file: fetch and return
-///   the plain-text SHA-1 hash inside.
-/// - A raw 40-character SHA-1 hex string: validate and return as-is.
+///   the plain-text SHA-1 hash inside, extracting the CDN base URL from it.
+/// - A raw 40-character SHA-1 hex string: validate and return as-is, using the
+///   default `download2.nexon.net` CDN base URL.
 fn resolve_target_hash(
     input: &str,
     appid: &str,
     allow_insecure: bool,
     proxy: Option<&str>,
-) -> Result<String> {
+) -> Result<crate::nxl::ResolvedHash> {
     let trimmed = input.trim();
 
     if trimmed.eq_ignore_ascii_case("latest") {
@@ -160,7 +160,12 @@ fn resolve_target_hash(
         if hash.is_empty() {
             bail!("latest manifest hash URL returned an empty response");
         }
-        Ok(hash)
+        // Extract base URL from the branch API URL.
+        let base_url = crate::nxl::ResolvedHash {
+            hash,
+            base_url: base_url_from_hash_url(&url),
+        };
+        Ok(base_url)
     } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         println!("Fetching target manifest hash from: {trimmed}");
         let bytes = http_get_bytes(&agent(allow_insecure, proxy), trimmed)
@@ -169,7 +174,8 @@ fn resolve_target_hash(
         if hash.is_empty() {
             bail!("target manifest hash URL returned an empty response");
         }
-        Ok(hash)
+        let base_url = base_url_from_hash_url(trimmed);
+        Ok(crate::nxl::ResolvedHash { hash, base_url })
     } else {
         let hash = trimmed.to_owned();
         if hash.len() != 40 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -178,8 +184,24 @@ fn resolve_target_hash(
                  a 40-character hex string, or an http(s) URL"
             );
         }
-        Ok(hash)
+        let base_url = default_patch_base_url(appid);
+        Ok(crate::nxl::ResolvedHash { hash, base_url })
     }
+}
+
+/// Extract the CDN base directory from a `.manifest.hash` URL by stripping
+/// the filename.
+fn base_url_from_hash_url(url: &str) -> String {
+    let url = url.trim_end_matches('/');
+    match url.rfind('/') {
+        Some(pos) => url[..pos].to_owned(),
+        None => url.to_owned(),
+    }
+}
+
+/// Default CDN base URL for patch assets on `download2.nexon.net`.
+fn default_patch_base_url(appid: &str) -> String {
+    format!("http://download2.nexon.net/Game/nxl/games/{appid}")
 }
 
 // ---------------------------------------------------------------------------
@@ -187,20 +209,20 @@ fn resolve_target_hash(
 // ---------------------------------------------------------------------------
 
 /// `…/patches/patch-{src8}-{dst8}` base URL for all patch assets.
-fn patch_base_url(appid: &str, src_hash: &str, dst_hash: &str) -> String {
+fn patch_base_url(base_url: &str, src_hash: &str, dst_hash: &str) -> String {
     let src8 = &src_hash[..8];
     let dst8 = &dst_hash[..8];
-    format!("{BASE_CDN}/{appid}/patches/patch-{src8}-{dst8}")
+    format!("{base_url}/patches/patch-{src8}-{dst8}")
 }
 
 fn fetch_diff_manifest(
-    appid: &str,
+    base_url: &str,
     src_hash: &str,
     dst_hash: &str,
     allow_insecure: bool,
     proxy: Option<&str>,
 ) -> Result<DiffManifest> {
-    let base = patch_base_url(appid, src_hash, dst_hash);
+    let base = patch_base_url(base_url, src_hash, dst_hash);
     let ag = agent(allow_insecure, proxy);
 
     // Step A: fetch the hash of the diff manifest.
@@ -435,6 +457,7 @@ fn patch_one_file(
 
 fn fallback_download_file(
     ag: &ureq::Agent,
+    base_url: &str,
     appid: &str,
     objects: &[String],
     objects_fsize: &[u64],
@@ -447,7 +470,7 @@ fn fallback_download_file(
 
     let mut out: Vec<u8> = Vec::new();
     for (obj_id, &expected_size) in objects.iter().zip(objects_fsize.iter()) {
-        let data = crate::nxl::download_object(ag, appid, obj_id)?;
+        let data = crate::nxl::download_object(ag, base_url, appid, obj_id)?;
         if data.len() as u64 != expected_size {
             bail!(
                 "object {obj_id}: size mismatch (expected {expected_size}, got {})",
@@ -500,10 +523,13 @@ pub fn patch_client(
     println!("Current (source) hash: {src_hash}");
 
     // Step 2 — resolve the target hash.
-    let dst_hash = resolve_target_hash(manifest_source, appid, allow_insecure, proxy)?;
+    let resolved = resolve_target_hash(manifest_source, appid, allow_insecure, proxy)?;
+    let dst_hash = &resolved.hash;
+    let base_url = &resolved.base_url;
     println!("Target hash:           {dst_hash}");
+    println!("CDN base URL:          {base_url}");
 
-    if src_hash.eq_ignore_ascii_case(&dst_hash) {
+    if src_hash.eq_ignore_ascii_case(dst_hash) {
         println!("Client is already at the target version — nothing to do.");
         return Ok(());
     }
@@ -535,7 +561,7 @@ pub fn patch_client(
     // Step 5 — fetch the diff manifest.
     println!();
     let diff_manifest =
-        fetch_diff_manifest(appid, &src_hash, &dst_hash, allow_insecure, proxy)?;
+        fetch_diff_manifest(base_url, &src_hash, dst_hash, allow_insecure, proxy)?;
     let total_entries = diff_manifest.diff_result.len();
     println!(
         "Diff manifest loaded: {total_entries} file(s) to patch, patcher_type = {:?}.",
@@ -556,7 +582,7 @@ pub fn patch_client(
 
     // Step 6 — patch files in parallel (up to PARALLEL_PATCHES threads).
     println!();
-    let patch_base = patch_base_url(appid, &src_hash, &dst_hash);
+    let patch_base = patch_base_url(base_url, &src_hash, dst_hash);
     let ag = agent(allow_insecure, proxy);
 
     let mp = MultiProgress::new();
@@ -678,7 +704,7 @@ pub fn patch_client(
         );
 
         let new_manifest =
-            crate::nxl::fetch_manifest(appid, &dst_hash, allow_insecure, proxy)
+            crate::nxl::fetch_manifest(base_url, dst_hash, allow_insecure, proxy)
                 .context("failed to fetch new manifest for fallback downloads")?;
 
         // Build a decoded-path → entry lookup table.
@@ -708,6 +734,7 @@ pub fn patch_client(
                     let dest = patched_dir.join(path);
                     match fallback_download_file(
                         &ag,
+                        base_url,
                         appid,
                         &info.objects,
                         &info.objects_fsize,
