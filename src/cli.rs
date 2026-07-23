@@ -96,6 +96,14 @@ pub struct Cli {
     /// certificate chain cannot be validated.
     #[arg(long)]
     pub allow_insecure: bool,
+
+    /// When patching a MapleStory client, rename the existing
+    /// `appdata/Data` directory to `appdata/DataBk` before applying
+    /// patches.  Patched and re-downloaded Data files are placed in a
+    /// fresh `appdata/Data` directory, while non-Data files are
+    /// overwritten in-place as usual.
+    #[arg(long)]
+    pub keep_old_wz: bool,
 }
 
 /// Subcommands for different game platform operations.
@@ -183,6 +191,12 @@ pub enum Commands {
         /// Skip TLS certificate verification (unsafe).
         #[arg(long)]
         allow_insecure: bool,
+
+        /// When patching a MapleStory client, rename the existing
+        /// `appdata/Data` directory to `appdata/DataBk` before applying
+        /// patches.  Patched Data files land in a fresh `appdata/Data`.
+        #[arg(long)]
+        keep_old_wz: bool,
     },
 
     /// NGM operations.

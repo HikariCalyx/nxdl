@@ -41,7 +41,7 @@
 
 use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -448,6 +448,83 @@ fn move_to_appdata(
 }
 
 // ---------------------------------------------------------------------------
+// --keep-old-wz helpers
+// ---------------------------------------------------------------------------
+
+/// Detect whether the client in `appdata_dir` is a MapleStory client and, if
+/// so, rename `appdata/Data` → `appdata/DataBk`.  Returns `true` when the
+/// backup was performed.
+fn detect_and_backup_data(appdata_dir: &Path) -> bool {
+    let data_dir = appdata_dir.join("Data");
+    if !data_dir.exists() || !data_dir.is_dir() {
+        println!("  --keep-old-wz: Data directory not found, skipping backup.");
+        return false;
+    }
+
+    // Try to detect MapleStory by reading Base.wz version.
+    let is_maple = check_is_maplestory(appdata_dir);
+
+    if !is_maple {
+        println!("  --keep-old-wz: not a MapleStory client, skipping backup.");
+        return false;
+    }
+
+    let data_bk = appdata_dir.join("DataBk");
+    if data_bk.exists() {
+        println!("  Removing previous DataBk backup…");
+        let _ = std::fs::remove_dir_all(&data_bk);
+    }
+    println!("  Backing up Data → DataBk…");
+    match std::fs::rename(&data_dir, &data_bk) {
+        Ok(()) => {
+            println!("  Backup complete.");
+            true
+        }
+        Err(e) => {
+            println!("  warning: failed to rename Data → DataBk: {e}");
+            false
+        }
+    }
+}
+
+/// Check whether the client is a MapleStory client by looking for a `Base.wz`
+/// file and reading its version.
+fn check_is_maplestory(appdata_dir: &Path) -> bool {
+    // Try Data/Base/Base.wz first, then root-level Base.wz.
+    let candidates = [
+        appdata_dir.join("Data").join("Base").join("Base.wz"),
+        appdata_dir.join("Base.wz"),
+    ];
+    for base_wz in &candidates {
+        if base_wz.exists() {
+            match crate::miniwzlib::get_wz_version(base_wz) {
+                Ok(v) if v.version > 0 => {
+                    println!("  Detected MapleStory client (v{}).", v.version);
+                    return true;
+                }
+                _ => continue,
+            }
+        }
+    }
+    false
+}
+
+/// Compute the path to the *old* (pre-patch) file on disk.
+///
+/// When `keep_old_wz` is active and the file lives under `Data/`, the old
+/// file is read from `DataBk/` (the renamed backup).  Otherwise it is read
+/// from the normal `appdata/` location.
+fn old_file_path_for_patch(appdata_dir: &Path, rel_path: &str, keep_old_wz: bool) -> PathBuf {
+    if keep_old_wz {
+        let normalized = rel_path.replace('\\', "/");
+        if let Some(rest) = normalized.strip_prefix("Data/") {
+            return appdata_dir.join("DataBk").join(rest);
+        }
+    }
+    appdata_dir.join(rel_path)
+}
+
+// ---------------------------------------------------------------------------
 // Single-file patch
 // ---------------------------------------------------------------------------
 
@@ -458,6 +535,7 @@ fn patch_one_file(
     entry: &DiffEntry,
     appdata_dir: &Path,
     patched_dir: &Path,
+    keep_old_wz: bool,
 ) -> Result<()> {
     let compressed: Vec<u8> = if !entry.parts.is_empty() {
         // Multi-part diff: download each part, verify, concatenate.
@@ -547,8 +625,9 @@ fn patch_one_file(
         .with_context(|| format!("failed to decompress diff for '{}'", entry.path))?;
 
     // Load the old file (empty slice if not present — handles brand-new files
-    // whose diff commands are all "copy from diff").
-    let old_path = appdata_dir.join(&entry.path);
+    // whose diff commands are all "copy from diff").  When --keep-old-wz is
+    // active and the file is under Data/, read from the DataBk backup.
+    let old_path = old_file_path_for_patch(appdata_dir, &entry.path, keep_old_wz);
     let old_data = if old_path.exists() {
         std::fs::read(&old_path)
             .with_context(|| format!("failed to read old file '{}'", old_path.display()))?
@@ -631,10 +710,19 @@ pub fn patch_client(
     target_dir: &Path,
     allow_insecure: bool,
     proxy: Option<&str>,
+    keep_old_wz: bool,
 ) -> Result<()> {
     let patchdata_dir = target_dir.join("patchdata");
     let appdata_dir   = target_dir.join("appdata");
     let patched_dir   = patchdata_dir.join("patched");
+
+    // Step 0 — when --keep-old-wz is set, detect MapleStory and back up
+    // the Data directory so the old .wz files are preserved.
+    let _data_backed_up = if keep_old_wz {
+        detect_and_backup_data(&appdata_dir)
+    } else {
+        false
+    };
 
     // Step 1 — read the source (current) hash.
     let hash_file = patchdata_dir.join(format!("{appid}.manifest.hash"));
@@ -783,6 +871,7 @@ pub fn patch_client(
                         entry,
                         appdata_dir,
                         patched_dir,
+                        keep_old_wz,
                     ) {
                         Ok(()) => {
                             patched_ok.fetch_add(1, Ordering::Relaxed);

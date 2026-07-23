@@ -42,6 +42,7 @@ fn main() -> Result<()> {
                 invert_filter,
                 proxy,
                 allow_insecure,
+                keep_old_wz,
             } => {
                 // ---- Login: interactive WebView, no appid required ----
                 if let Some(region_opt) = login {
@@ -173,6 +174,7 @@ fn main() -> Result<()> {
                         &target_path,
                         allow_insecure,
                         proxy,
+                        *keep_old_wz,
                     )?;
                 } else {
                     println!("  (no action specified; use --check [MANIFEST_URL], --download <MANIFEST_URL> <TARGET_PATH>, --patch <MANIFEST_URL> <TARGET_PATH>, or --login [REGION])");
@@ -436,6 +438,7 @@ fn main() -> Result<()> {
                     &target_path,
                     allow_insecure,
                     proxy,
+                    cli.keep_old_wz,
                 )?;
             } else {
                 println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
