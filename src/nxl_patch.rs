@@ -107,13 +107,33 @@ pub struct DiffManifest {
     pub version: Option<String>,
 }
 
+/// A single part of a multi-part diff file.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct DiffPart {
+    /// Relative path to this part's `.diff` file (already includes the
+    /// `.diff` / `.diff.001` suffix).
+    pub path: String,
+    /// MD5 hex string of this part's compressed data.
+    pub checksum: String,
+    /// Byte size of this part's compressed data.
+    pub file_size: u64,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct DiffEntry {
     pub path: String,
-    /// MD5 hex string of the compressed `.diff` file.
+    /// MD5 hex string of the compressed `.diff` file (single-part) or of the
+    /// concatenated parts (multi-part).  May be empty for multi-part entries.
+    #[serde(default)]
     pub checksum: String,
-    /// Byte size of the compressed `.diff` file.
+    /// Byte size of the compressed `.diff` file (single-part) or total size of
+    /// all concatenated parts (multi-part).
+    #[serde(default)]
     pub file_size: u64,
+    /// Optional multi-part entries for large diffs.  When non-empty, each part
+    /// is downloaded, verified, and concatenated before decompression.
+    #[serde(default)]
+    pub parts: Vec<DiffPart>,
     #[serde(rename = "type")]
     #[allow(dead_code)]
     pub entry_type: u32,
@@ -384,6 +404,49 @@ fn mark_completed(writer: &Mutex<std::fs::File>, rel_path: &str) -> std::io::Res
     file.flush()
 }
 
+/// Remove empty parent directories of `rel_path` under `patched_dir`, walking
+/// upward until a non-empty directory is hit or we reach `patched_dir` itself.
+fn remove_empty_parents(patched_dir: &Path, rel_path: &str) {
+    let mut current = patched_dir.join(rel_path);
+    // Strip the filename to get the file's parent directory.
+    current.pop();
+    while current != patched_dir {
+        // `remove_dir` only succeeds on empty directories.
+        if std::fs::remove_dir(&current).is_err() {
+            break;
+        }
+        current.pop();
+    }
+}
+
+/// Move a fully patched / downloaded file from `patched_dir` to `appdata_dir`
+/// and clean up any empty directories left behind in `patched_dir`.
+fn move_to_appdata(
+    patched_dir: &Path,
+    appdata_dir: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    let src = patched_dir.join(rel_path);
+    let dst = appdata_dir.join(rel_path);
+
+    // Create destination parent directories.
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
+    }
+
+    // Try an atomic rename first; fall back to copy + delete.
+    std::fs::rename(&src, &dst).or_else(|_| {
+        std::fs::copy(&src, &dst).and_then(|_| std::fs::remove_file(&src))
+    })
+    .with_context(|| format!("failed to move '{}' into appdata", rel_path))?;
+
+    // Clean up empty parent directories in the staging area.
+    remove_empty_parents(patched_dir, rel_path);
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Single-file patch
 // ---------------------------------------------------------------------------
@@ -396,30 +459,88 @@ fn patch_one_file(
     appdata_dir: &Path,
     patched_dir: &Path,
 ) -> Result<()> {
-    // Download the compressed `.diff` file.
-    let diff_url = format!("{patch_base}/{appid}/{}.diff", entry.path);
-    let compressed = http_get_bytes(ag, &diff_url)
-        .with_context(|| format!("failed to download diff for '{}'", entry.path))?;
+    let compressed: Vec<u8> = if !entry.parts.is_empty() {
+        // Multi-part diff: download each part, verify, concatenate.
+        let mut buf = Vec::with_capacity(entry.file_size as usize);
+        for part in &entry.parts {
+            let part_url = format!("{patch_base}/{appid}/{}", part.path);
+            let data = http_get_bytes(ag, &part_url)
+                .with_context(|| format!("failed to download diff part '{}'", part.path))?;
 
-    // Verify compressed size.
-    if compressed.len() as u64 != entry.file_size {
-        bail!(
-            "diff '{}': compressed-size mismatch (expected {}, got {})",
-            entry.path,
-            entry.file_size,
-            compressed.len()
-        );
-    }
+            // Verify part compressed size.
+            if data.len() as u64 != part.file_size {
+                bail!(
+                    "diff part '{}': compressed-size mismatch (expected {}, got {})",
+                    part.path,
+                    part.file_size,
+                    data.len()
+                );
+            }
 
-    // Verify MD5 checksum of the compressed data.
-    let actual_md5 = format!("{:x}", md5::compute(&compressed));
-    if !actual_md5.eq_ignore_ascii_case(&entry.checksum) {
-        bail!(
-            "diff '{}': MD5 mismatch (expected {}, got {actual_md5})",
-            entry.path,
-            entry.checksum
-        );
-    }
+            // Verify part MD5 checksum.
+            let actual_md5 = format!("{:x}", md5::compute(&data));
+            if !actual_md5.eq_ignore_ascii_case(&part.checksum) {
+                bail!(
+                    "diff part '{}': MD5 mismatch (expected {}, got {actual_md5})",
+                    part.path,
+                    part.checksum
+                );
+            }
+
+            buf.extend_from_slice(&data);
+        }
+
+        // Verify total concatenated size.
+        if buf.len() as u64 != entry.file_size {
+            bail!(
+                "diff '{}': concatenated-size mismatch (expected {}, got {})",
+                entry.path,
+                entry.file_size,
+                buf.len()
+            );
+        }
+
+        // Verify total MD5 if the manifest provides one.
+        if !entry.checksum.is_empty() {
+            let actual_md5 = format!("{:x}", md5::compute(&buf));
+            if !actual_md5.eq_ignore_ascii_case(&entry.checksum) {
+                bail!(
+                    "diff '{}': concatenated MD5 mismatch (expected {}, got {actual_md5})",
+                    entry.path,
+                    entry.checksum
+                );
+            }
+        }
+
+        buf
+    } else {
+        // Single-part diff: download the compressed `.diff` file.
+        let diff_url = format!("{patch_base}/{appid}/{}.diff", entry.path);
+        let data = http_get_bytes(ag, &diff_url)
+            .with_context(|| format!("failed to download diff for '{}'", entry.path))?;
+
+        // Verify compressed size.
+        if data.len() as u64 != entry.file_size {
+            bail!(
+                "diff '{}': compressed-size mismatch (expected {}, got {})",
+                entry.path,
+                entry.file_size,
+                data.len()
+            );
+        }
+
+        // Verify MD5 checksum of the compressed data.
+        let actual_md5 = format!("{:x}", md5::compute(&data));
+        if !actual_md5.eq_ignore_ascii_case(&entry.checksum) {
+            bail!(
+                "diff '{}': MD5 mismatch (expected {}, got {actual_md5})",
+                entry.path,
+                entry.checksum
+            );
+        }
+
+        data
+    };
 
     // Decompress.
     let diff_data = decompress_zlib(&compressed)
@@ -448,6 +569,9 @@ fn patch_one_file(
     std::fs::write(&dest, &new_data)
         .with_context(|| format!("failed to write patched file '{}'", dest.display()))?;
 
+    // Move into appdata immediately so the file is usable right away.
+    move_to_appdata(patched_dir, appdata_dir, &entry.path)?;
+
     Ok(())
 }
 
@@ -462,6 +586,8 @@ fn fallback_download_file(
     objects: &[String],
     objects_fsize: &[u64],
     dest: &Path,
+    worker_bar: &ProgressBar,
+    total_bar: &ProgressBar,
 ) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
@@ -478,6 +604,8 @@ fn fallback_download_file(
             );
         }
         out.extend_from_slice(&data);
+        worker_bar.inc(expected_size);
+        total_bar.inc(expected_size);
     }
 
     std::fs::write(dest, &out)
@@ -715,9 +843,15 @@ pub fn patch_client(
             }
         }
 
-        let mut dl_ok: usize = 0;
-        let mut dl_fail: usize = 0;
-        let mut dl_fail_paths: Vec<String> = Vec::new();
+        // Resolve each failed path to its manifest entry (for parallel download).
+        struct FallbackEntry {
+            path: String,
+            objects: Vec<String>,
+            objects_fsize: Vec<u64>,
+            fsize: u64,
+        }
+        let mut fallback_entries: Vec<FallbackEntry> = Vec::new();
+        let mut not_found: Vec<String> = Vec::new();
 
         for path in &failed_paths {
             // Diff-manifest paths use forward slashes; decoded manifest paths
@@ -731,48 +865,157 @@ pub fn patch_client(
 
             match file_info {
                 Some(info) => {
-                    let dest = patched_dir.join(path);
-                    match fallback_download_file(
-                        &ag,
-                        base_url,
-                        appid,
-                        &info.objects,
-                        &info.objects_fsize,
-                        &dest,
-                    ) {
-                        Ok(()) => {
-                            dl_ok += 1;
-                            if let Err(e) = mark_completed(&incomplete_writer, path) {
-                                eprintln!(
-                                    "warning: could not record '{}' as completed: {e}",
-                                    path
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("error: fallback download failed for '{path}': {e:#}");
-                            dl_fail += 1;
-                            dl_fail_paths.push(path.clone());
-                        }
-                    }
+                    fallback_entries.push(FallbackEntry {
+                        path: path.clone(),
+                        objects: info.objects.clone(),
+                        objects_fsize: info.objects_fsize.clone(),
+                        fsize: info.fsize,
+                    });
                 }
                 None => {
-                    eprintln!("warning: '{path}' not found in new manifest — cannot download.");
-                    dl_fail += 1;
-                    dl_fail_paths.push(path.clone());
+                    eprintln!(
+                        "warning: '{path}' not found in new manifest — cannot download."
+                    );
+                    not_found.push(path.clone());
                 }
             }
         }
 
-        println!("Fallback downloads: {dl_ok} succeeded, {dl_fail} failed.");
-        for p in &dl_fail_paths {
-            eprintln!("  still failed: {p}");
+        if fallback_entries.is_empty() {
+            println!("No files to download (all failed paths missing from manifest).");
+        } else {
+            // Progress bars for the fallback phase.
+            let total_bytes: u64 = fallback_entries.iter().map(|e| e.fsize).sum();
+            let mp = MultiProgress::new();
+            if !std::io::stdout().is_terminal() {
+                mp.set_draw_target(ProgressDrawTarget::hidden());
+            }
+            let total_pb = mp.add(ProgressBar::new(total_bytes));
+            total_pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+                     {bytes}/{total_bytes} ({binary_bytes_per_sec}, ETA {eta})",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            total_pb.enable_steady_tick(Duration::from_millis(120));
+
+            let n_workers = PARALLEL_PATCHES.min(fallback_entries.len()).max(1);
+            let worker_bars: Vec<ProgressBar> = (0..n_workers)
+                .map(|_| {
+                    let pb = mp.add(ProgressBar::new(0));
+                    pb.set_style(
+                        ProgressStyle::with_template(
+                            "  [{bar:25.green/white}] {bytes:>10}/{total_bytes:>10} \
+                             ({binary_bytes_per_sec:>11}) {wide_msg}",
+                        )
+                        .unwrap()
+                        .progress_chars("=>-"),
+                    );
+                    pb.enable_steady_tick(Duration::from_millis(120));
+                    pb
+                })
+                .collect();
+
+            let counter = AtomicUsize::new(0);
+            let dl_ok = AtomicUsize::new(0);
+            let dl_fail = AtomicUsize::new(0);
+            let dl_fail_paths: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+            std::thread::scope(|scope| {
+                let fallback_entries  = &fallback_entries;
+                let counter           = &counter;
+                let dl_ok             = &dl_ok;
+                let dl_fail           = &dl_fail;
+                let dl_fail_paths     = &dl_fail_paths;
+                let total_pb          = &total_pb;
+                let ag                = &ag;
+                let patched_dir       = &patched_dir;
+                let appdata_dir       = &appdata_dir;
+                let incomplete_writer = &incomplete_writer;
+
+                for bar in worker_bars.iter().cloned() {
+                    scope.spawn(move || {
+                        loop {
+                            let idx = counter.fetch_add(1, Ordering::Relaxed);
+                            if idx >= fallback_entries.len() {
+                                break;
+                            }
+                            let entry = &fallback_entries[idx];
+
+                            bar.set_length(entry.fsize);
+                            bar.set_position(0);
+                            bar.set_message(entry.path.clone());
+
+                            let dest = patched_dir.join(&entry.path);
+                            match fallback_download_file(
+                                ag,
+                                base_url,
+                                appid,
+                                &entry.objects,
+                                &entry.objects_fsize,
+                                &dest,
+                                &bar,
+                                total_pb,
+                            ) {
+                                Ok(()) => {
+                                    // Move into appdata immediately.
+                                    if let Err(e) = move_to_appdata(
+                                        patched_dir,
+                                        appdata_dir,
+                                        &entry.path,
+                                    ) {
+                                        dl_fail.fetch_add(1, Ordering::Relaxed);
+                                        bar.println(format!(
+                                            "error: failed to move '{}' into appdata: {e:#}",
+                                            entry.path
+                                        ));
+                                        dl_fail_paths.lock().unwrap().push(entry.path.clone());
+                                        continue;
+                                    }
+                                    dl_ok.fetch_add(1, Ordering::Relaxed);
+                                    if let Err(e) =
+                                        mark_completed(incomplete_writer, &entry.path)
+                                    {
+                                        bar.println(format!(
+                                            "warning: could not record '{}' as completed: {e}",
+                                            entry.path
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    dl_fail.fetch_add(1, Ordering::Relaxed);
+                                    bar.println(format!(
+                                        "error: fallback download failed for '{}': {e:#}",
+                                        entry.path
+                                    ));
+                                    dl_fail_paths.lock().unwrap().push(entry.path.clone());
+                                }
+                            }
+                        }
+                        bar.finish_and_clear();
+                    });
+                }
+            });
+
+            total_pb.finish_and_clear();
+
+            let dl_ok = dl_ok.load(Ordering::Relaxed);
+            let dl_fail = dl_fail.load(Ordering::Relaxed) + not_found.len();
+            let mut dl_fail_paths = dl_fail_paths.into_inner().unwrap();
+            dl_fail_paths.extend(not_found);
+
+            println!("Fallback downloads: {dl_ok} succeeded, {dl_fail} failed.");
+            for p in &dl_fail_paths {
+                eprintln!("  still failed: {p}");
+            }
         }
     }
 
-    // Step 8 — move patched files into appdata/.
+    // Step 8 — move any remaining patched files into appdata/.
     println!();
-    println!("Moving patched files into appdata…");
+    println!("Moving any remaining patched files into appdata…");
 
     // Reload the completed set so we pick up both the previous-run files and
     // everything just patched / downloaded this run.
@@ -783,24 +1026,9 @@ pub fn patch_client(
     for rel_path in &all_completed {
         let src = patched_dir.join(rel_path);
         if !src.exists() {
-            continue; // was listed but file is absent — skip silently.
+            continue; // already moved earlier — skip silently.
         }
-        let dst = appdata_dir.join(rel_path);
-        if let Some(parent) = dst.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "error: failed to create '{}': {e}",
-                    parent.display()
-                );
-                move_fail += 1;
-                continue;
-            }
-        }
-        // Try an atomic rename first; fall back to copy + delete.
-        let result = std::fs::rename(&src, &dst).or_else(|_| {
-            std::fs::copy(&src, &dst).and_then(|_| std::fs::remove_file(&src))
-        });
-        match result {
+        match move_to_appdata(&patched_dir, &appdata_dir, rel_path) {
             Ok(()) => move_ok += 1,
             Err(e) => {
                 eprintln!("error: failed to move '{rel_path}': {e}");

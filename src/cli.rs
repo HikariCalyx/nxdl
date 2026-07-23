@@ -280,6 +280,16 @@ const NGM_ALIASES: &[(&str, &str)] = &[
     ("msn", "106690@d811"),
 ];
 
+/// Known appid aliases for TCG games (case-insensitive).
+const TCG_ALIASES: &[(&str, &str)] = &[
+    ("ckr", "4"),
+    ("cmb", "10200"),
+    ("cmh", "10300"),
+    ("cfs", "5"),
+    ("cfsc", "101"),
+    ("ccsol", "3"),
+];
+
 /// Resolve a raw appid string (number or alias) to an app ID string.
 ///
 /// If the input is already a numeric string, it is returned as-is.
