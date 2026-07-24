@@ -292,6 +292,7 @@ const NGM_ALIASES: &[(&str, &str)] = &[
     ("jms", "16785939@bb01"),
     ("kmsm", "106656"),
     ("msn", "106690@d811"),
+    ("tms_cw", "2982@2141"),
 ];
 
 /// Known appid aliases for TCG games (case-insensitive).
