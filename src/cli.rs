@@ -13,7 +13,8 @@ pub struct Cli {
     /// When --appid is not provided, the game name is looked up in the alias table.
     /// Applicable aliases: 
     /// gms, gms_pts, gms_cw, gmb, vin_gl,
-    /// jms, msn, jmb, kmb, kmbt, tales_jp.
+    /// jms, msn, jmb, kmb, kmbt, tales_jp,
+    /// tms_cw.
     #[arg(value_name = "GAME")]
     pub game: Option<String>,
 
