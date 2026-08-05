@@ -516,6 +516,50 @@ pub fn download_client(
     Ok(())
 }
 
+/// Uncompressed size of a single object block in the current NXL manifest
+/// layout, where `objects_fsize` holds *compressed* download sizes. Each block
+/// decompresses to a fixed 4 MiB of data, except the final block of a file.
+const BLOCK_UNCOMPRESSED_SIZE: u64 = 4 * 1024 * 1024;
+
+/// Compute the expected *uncompressed* size and write offset of each object
+/// block, supporting both manifest layouts observed in the wild:
+///
+/// - **Legacy:** `objects_fsize` holds the uncompressed size of each block, so
+///   `sum(objects_fsize) == fsize`. Offsets are the cumulative sum.
+/// - **Current:** `objects_fsize` holds the *compressed* download size of each
+///   block. Each block decompresses to a fixed [`BLOCK_UNCOMPRESSED_SIZE`]
+///   (the last block holds the remainder), so offset `i` is
+///   `i * BLOCK_UNCOMPRESSED_SIZE`.
+///
+/// Returns `(uncompressed_sizes, offsets)`.
+fn block_layout(objects_fsize: &[u64], total_fsize: u64) -> (Vec<u64>, Vec<u64>) {
+    let n = objects_fsize.len();
+    let sum: u64 = objects_fsize.iter().sum();
+
+    if sum == total_fsize {
+        // Legacy layout: objects_fsize are uncompressed block sizes.
+        let sizes = objects_fsize.to_vec();
+        let mut offsets = Vec::with_capacity(n);
+        let mut acc = 0u64;
+        for &s in &sizes {
+            offsets.push(acc);
+            acc += s;
+        }
+        (sizes, offsets)
+    } else {
+        // Current layout: fixed 4 MiB uncompressed blocks.
+        let mut sizes = Vec::with_capacity(n);
+        let mut offsets = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = (i as u64) * BLOCK_UNCOMPRESSED_SIZE;
+            offsets.push(off);
+            let remaining = total_fsize.saturating_sub(off);
+            sizes.push(remaining.min(BLOCK_UNCOMPRESSED_SIZE));
+        }
+        (sizes, offsets)
+    }
+}
+
 /// Download all object blocks for one file, concatenate them, and write to
 /// `dest_path`.  Objects are fetched with up to [`PARALLEL_OBJECTS`] concurrent
 /// requests.
@@ -546,14 +590,10 @@ fn download_one_file(
     let num_objects = objects.len();
     let progress_path = crate::resume::progress_path(dest_path, &crate::resume::SIDECAR_NXL);
 
-    // Compute cumulative byte offsets for each object.
-    let offsets: Vec<u64> = std::iter::once(0)
-        .chain(objects_fsize.iter().scan(0, |acc, &sz| {
-            *acc += sz;
-            Some(*acc)
-        }))
-        .take(num_objects)
-        .collect();
+    // Resolve the uncompressed size and write offset of each block. `objects_fsize`
+    // may hold either uncompressed sizes (legacy) or compressed download sizes
+    // (current); `block_layout` normalizes both to uncompressed sizes/offsets.
+    let (block_sizes, offsets) = block_layout(objects_fsize, total_fsize);
 
     // --- Check for a resumable sidecar ---
     let completed_mask: Vec<bool> = if let Some((bitmap, saved_objects, saved_size)) =
@@ -569,7 +609,7 @@ fn download_one_file(
                 .iter()
                 .enumerate()
                 .filter(|(_, &b)| b != 0)
-                .map(|(i, _)| objects_fsize.get(i).copied().unwrap_or(0))
+                .map(|(i, _)| block_sizes.get(i).copied().unwrap_or(0))
                 .sum();
             let done_count = bitmap.iter().filter(|&&b| b != 0).count();
             if done_count > 0 {
@@ -619,13 +659,14 @@ fn download_one_file(
     }
 
     if num_objects == 1 && !is_resuming {
-        // Fast path: single object, no resume — download directly.
+        // Fast path: single object, no resume — download directly. A
+        // single-object file is exactly one block, so its decompressed size is
+        // the full file size in both manifest layouts.
         let data = download_object(agent, base_url, appid, &objects[0])?;
-        let expected = objects_fsize.first().copied().unwrap_or(0);
-        if data.len() as u64 != expected {
+        if data.len() as u64 != total_fsize {
             bail!(
                 "object {} decompressed size mismatch: expected {}, got {}",
-                &objects[0], expected, data.len()
+                &objects[0], total_fsize, data.len()
             );
         }
         std::fs::write(dest_path, &data)
@@ -655,7 +696,7 @@ fn download_one_file(
                     let i = pending[idx];
 
                     let object_id = &objects[i];
-                    let expected_size = objects_fsize.get(i).copied().unwrap_or(0);
+                    let expected_size = block_sizes.get(i).copied().unwrap_or(0);
 
                     match download_object(agent, base_url, appid, object_id) {
                         Ok(data) => {
