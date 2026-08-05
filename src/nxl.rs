@@ -206,7 +206,7 @@ pub fn fetch_manifest(
     let compressed = http_get_bytes(&agent, &url)
         .with_context(|| format!("failed to fetch manifest from {url}"))?;
 
-    let json_bytes = decompress_zlib(&compressed)
+    let json_bytes = decompress(&compressed)
         .context("failed to decompress manifest")?;
 
     let manifest: Manifest =
@@ -260,7 +260,7 @@ pub fn download_object(agent: &ureq::Agent, base_url: &str, appid: &str, object_
     let compressed = http_get_bytes(agent, &url)
         .with_context(|| format!("failed to download object {object_id}"))?;
 
-    let data = decompress_zlib(&compressed)
+    let data = decompress(&compressed)
         .with_context(|| format!("failed to decompress object {object_id}"))?;
 
     // Verify SHA-1.
@@ -905,6 +905,32 @@ pub fn check_client(
 // ---------------------------------------------------------------------------
 // Utility
 // ---------------------------------------------------------------------------
+
+/// Decompress a manifest or file block.
+///
+/// Historically the NXL CDN serves raw zlib-wrapped data (header `78 9c`), but
+/// some objects are now compressed with LZMA2 (in an `.xz` container, magic
+/// `FD 37 7A 58 5A 00`). We try LZMA2 first and fall back to zlib.
+fn decompress(data: &[u8]) -> Result<Vec<u8>> {
+    match decompress_xz(data) {
+        Ok(out) => Ok(out),
+        Err(xz_err) => decompress_zlib(data).map_err(|zlib_err| {
+            anyhow!(
+                "failed to decompress data: LZMA2/xz attempt failed ({xz_err:#}); \
+                 zlib fallback failed ({zlib_err:#})"
+            )
+        }),
+    }
+}
+
+/// Decompress LZMA2 data wrapped in an `.xz` container.
+fn decompress_xz(data: &[u8]) -> Result<Vec<u8>> {
+    let mut reader = std::io::BufReader::new(data);
+    let mut out = Vec::new();
+    lzma_rs::xz_decompress(&mut reader, &mut out)
+        .map_err(|e| anyhow!("xz decompression failed: {e}"))?;
+    Ok(out)
+}
 
 /// Decompress raw zlib-wrapped data (header `78 9c`).
 fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>> {
