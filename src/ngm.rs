@@ -7,6 +7,17 @@
 //! 4. Parse manifest entries (base64-encoded UTF-8 file paths, chunk objects,
 //!    decompressed sizes, SHA-1 hashes)
 //! 5. Print summary (and file list when verbose).
+//!
+//! Patch protocol:
+//! 1. Read the current manifest hash from
+//!    `<target>/<stripped_appid>.manifest.hash`
+//! 2. Resolve the target manifest hash: an explicit hash, or the latest
+//!    one from the game-info API
+//! 3. Download the patch manifest from `{setup_file_url}/{target}-{current}`
+//!    into `<target>/patchdata/patch_<target8>-<current8>.json`
+//! 4. Download, decompress, and concatenate the `.nxdelta` chunks of each
+//!    patched file into `<target>/patchdata/patches/<encoded>.nxdlpatch`
+//! 5. (TODO) Apply the patch files to the client.
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
@@ -607,6 +618,39 @@ fn fetch_game_and_manifest(
 }
 
 // ---------------------------------------------------------------------------
+// Patch: manifest hash helpers
+// ---------------------------------------------------------------------------
+
+/// Strip the `@suffix` from an NGM appid, keeping only the leading numeric
+/// part.  Examples: `"2982@2141"` → `"2982"`, `"589825"` → `"589825"`.
+fn stripped_appid(appid: &str) -> &str {
+    appid.split('@').next().unwrap_or(appid)
+}
+
+/// Path of the manifest-hash file for an appid inside `target_dir`:
+/// `<target_dir>/<stripped_appid>.manifest.hash`.
+fn manifest_hash_path(target_dir: &Path, appid: &str) -> std::path::PathBuf {
+    target_dir.join(format!("{}.manifest.hash", stripped_appid(appid)))
+}
+
+/// Write the manifest name of the current version to
+/// `<target_dir>/<stripped_appid>.manifest.hash`.
+pub fn write_manifest_hash(
+    target_dir: &Path,
+    appid: &str,
+    manifest_name: &str,
+) -> Result<()> {
+    std::fs::create_dir_all(target_dir).with_context(|| {
+        format!("failed to create directory {}", target_dir.display())
+    })?;
+    let hash_path = manifest_hash_path(target_dir, appid);
+    std::fs::write(&hash_path, manifest_name)
+        .with_context(|| format!("failed to write manifest hash to {}", hash_path.display()))?;
+    println!("Saved manifest hash to: {}", hash_path.display());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Download: chunk fetching
 // ---------------------------------------------------------------------------
 
@@ -1068,6 +1112,366 @@ pub fn download_ngm(
             println!("  {f}");
         }
         bail!("{} file(s) failed to download", failures.len());
+    }
+
+    // ---- Persist the current manifest name (used by future patches) ----
+    if let Some(name) = info.manifest_name.as_deref() {
+        write_manifest_hash(target_dir, appid, name)?;
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Patch: patch manifest & .nxdelta download
+// ---------------------------------------------------------------------------
+
+/// A single patch file entry inside an NGM patch manifest.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct NgmPatchFile {
+    /// Map of chunk index (as string) → chunk SHA-1 hex hash.
+    objects: HashMap<String, String>,
+    /// Per-chunk sizes (not needed yet; kept for future patch application).
+    #[allow(dead_code)]
+    object_sizes: HashMap<String, u64>,
+    /// Decompressed size of the complete patch file.
+    uncompressed_size: u64,
+    /// Compressed size of the complete patch file (used for progress bars).
+    #[allow(dead_code)]
+    compressed_size: u64,
+    /// SHA-1 hex hash of the complete patch file.
+    #[allow(dead_code)]
+    hash: String,
+}
+
+/// Top-level NGM patch manifest.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct NgmPatchManifest {
+    files: HashMap<String, NgmPatchFile>,
+    #[allow(dead_code)]
+    version: Option<String>,
+}
+
+/// A single resolved patch entry ready for download.
+struct ResolvedNgmPatch {
+    /// Base64-encoded file name (the manifest key, also the URL component).
+    encoded_path: String,
+    /// File-level SHA-1 hash (the `<total_hash>` component in chunk URLs).
+    file_hash: String,
+    /// Ordered list of `(chunk_id, chunk_hash)` sorted by chunk_id.
+    chunks: Vec<(u32, String)>,
+    /// Decompressed size of the complete patch file.
+    uncompressed_size: u64,
+    /// Compressed size of the complete patch file.
+    compressed_size: u64,
+}
+
+/// First 8 characters of `s` (used to build patch file names).
+fn first8(s: &str) -> &str {
+    s.get(..8).unwrap_or(s)
+}
+
+/// Download all `.nxdelta` chunks for one patch entry, decompress each of
+/// them, and concatenate them into a single patch file at `dest_path`.
+///
+/// Chunk URL:
+/// `{setup_base}/{encoded_path}.{chunk_id}.{chunk_hash}.{file_hash}.nxdelta`
+fn download_ngm_patch_file(
+    agent: &ureq::Agent,
+    setup_base: &str,
+    entry: &ResolvedNgmPatch,
+    dest_path: &Path,
+    worker_bar: &ProgressBar,
+    total_bar: &ProgressBar,
+) -> Result<()> {
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(entry.uncompressed_size as usize);
+
+    for (chunk_id, chunk_hash) in &entry.chunks {
+        let url = format!(
+            "{setup_base}/{}.{chunk_id}.{chunk_hash}.{}.nxdelta",
+            entry.encoded_path, entry.file_hash,
+        );
+        let compressed = http_get_bytes(agent, &url)
+            .with_context(|| format!("failed to download patch chunk {chunk_hash}"))?;
+        let data = decompress_zlib(&compressed)
+            .with_context(|| format!("failed to decompress patch chunk {chunk_hash}"))?;
+
+        // Verify the chunk SHA-1 against the patch manifest.
+        let actual = hex::encode(Sha1::digest(&data));
+        if !actual.eq_ignore_ascii_case(chunk_hash) {
+            bail!(
+                "SHA-1 mismatch for patch chunk {chunk_hash}: expected {chunk_hash}, got {actual}"
+            );
+        }
+
+        worker_bar.inc(compressed.len() as u64);
+        total_bar.inc(compressed.len() as u64);
+        out.extend_from_slice(&data);
+    }
+
+    if out.len() as u64 != entry.uncompressed_size {
+        bail!(
+            "patch size mismatch for {}: expected {}, got {}",
+            entry.encoded_path,
+            entry.uncompressed_size,
+            out.len()
+        );
+    }
+
+    std::fs::write(dest_path, &out)
+        .with_context(|| format!("failed to write patch file {}", dest_path.display()))?;
+    Ok(())
+}
+
+/// Patch an NGM client from its current version to a newer version.
+///
+/// `manifest_source` selects the *target* version: `None` or `"latest"`
+/// resolves the newest manifest from the NGM API; any other value is used
+/// directly as the target manifest hash.
+///
+/// The current version is read from
+/// `<target_dir>/<stripped_appid>.manifest.hash`.  The patch manifest is
+/// downloaded into
+/// `<target_dir>/patchdata/patch_<target8>-<current8>.json`, and the
+/// `.nxdelta` chunks of each patched file are downloaded, decompressed, and
+/// concatenated into `<target_dir>/patchdata/patches/<encoded>.nxdlpatch`.
+///
+/// Applying the patches to the client files is not implemented yet.
+pub fn patch_ngm(
+    appid: &str,
+    manifest_source: Option<&str>,
+    target_dir: &Path,
+    allow_insecure: bool,
+    proxy: Option<&str>,
+) -> Result<()> {
+    let agent = agent(allow_insecure, proxy);
+
+    // ---- Step 1: read the current manifest hash ----
+    let hash_file = manifest_hash_path(target_dir, appid);
+    let src_hash = std::fs::read_to_string(&hash_file)
+        .with_context(|| {
+            format!(
+                "failed to read current manifest hash from '{}' — \
+                 has the client been downloaded yet?",
+                hash_file.display()
+            )
+        })?
+        .trim()
+        .to_owned();
+    if src_hash.is_empty() {
+        bail!("current manifest hash in '{}' is empty", hash_file.display());
+    }
+    println!("Current (source) manifest hash: {src_hash}");
+
+    // ---- Step 2: fetch game info (setup_file_url + latest manifest hash) ----
+    let info_url = format!("https://ngmapi.nexon.com/game-info/{appid}");
+    let info_json = http_get_string(&agent, &info_url)
+        .with_context(|| format!("failed to fetch game info from {info_url}"))?;
+    let info: GameInfo =
+        serde_json::from_str(&info_json).context("failed to parse game-info response")?;
+    let setup_base = info.setup_file_url.trim_end_matches('/');
+    let latest_hash = info
+        .manifest_name
+        .as_deref()
+        .ok_or_else(|| anyhow!("no manifest available for {appid}"))?;
+    println!("Latest manifest hash:      {latest_hash}");
+
+    // Resolve the target version: an explicit hash, `latest`, or (when no
+    // source was given) the newest manifest from the API.
+    let dst_hash: &str = match manifest_source.map(str::trim) {
+        None => latest_hash,
+        Some(src) if src.eq_ignore_ascii_case("latest") => latest_hash,
+        Some(src) => src,
+    };
+    if dst_hash.is_empty() {
+        bail!("target manifest hash must not be empty");
+    }
+    println!("Target manifest hash:      {dst_hash}");
+
+    if src_hash.eq_ignore_ascii_case(dst_hash) {
+        println!("Client is already at the target version — nothing to do.");
+        return Ok(());
+    }
+
+    // ---- Step 3: download the patch manifest ----
+    let patchdata_dir = target_dir.join("patchdata");
+    std::fs::create_dir_all(&patchdata_dir).with_context(|| {
+        format!("failed to create directory {}", patchdata_dir.display())
+    })?;
+
+    let patch_manifest_url = format!("{setup_base}/{dst_hash}-{src_hash}");
+    println!("Patch manifest URL:       {patch_manifest_url}");
+
+    let patch_json_name = format!("patch_{}-{}.json", first8(dst_hash), first8(&src_hash));
+    let patch_json_path = patchdata_dir.join(patch_json_name);
+
+    let patch_bytes = http_get_bytes(&agent, &patch_manifest_url).with_context(|| {
+        format!("failed to download patch manifest from {patch_manifest_url}")
+    })?;
+    std::fs::write(&patch_json_path, &patch_bytes).with_context(|| {
+        format!(
+            "failed to write patch manifest to {}",
+            patch_json_path.display()
+        )
+    })?;
+    println!("Saved patch manifest to:  {}", patch_json_path.display());
+
+    let patch_manifest: NgmPatchManifest = serde_json::from_slice(&patch_bytes).with_context(
+        || format!("failed to parse patch manifest {}", patch_json_path.display()),
+    )?;
+
+    // ---- Step 4: resolve patch entries ----
+    let mut entries: Vec<ResolvedNgmPatch> = Vec::with_capacity(patch_manifest.files.len());
+    for (encoded_path, file_info) in &patch_manifest.files {
+        let mut chunks: Vec<(u32, String)> = file_info
+            .objects
+            .iter()
+            .filter_map(|(k, v)| k.parse::<u32>().ok().map(|id| (id, v.clone())))
+            .collect();
+        chunks.sort_by_key(|(id, _)| *id);
+        if chunks.is_empty() {
+            eprintln!("warning: skipping patch entry with no chunks: {encoded_path}");
+            continue;
+        }
+        entries.push(ResolvedNgmPatch {
+            encoded_path: encoded_path.clone(),
+            file_hash: file_info.hash.clone(),
+            chunks,
+            uncompressed_size: file_info.uncompressed_size,
+            compressed_size: file_info.compressed_size,
+        });
+    }
+    entries.sort_by(|a, b| a.encoded_path.cmp(&b.encoded_path));
+
+    let total_compressed: u64 = entries.iter().map(|e| e.compressed_size).sum();
+    println!(
+        "Patch manifest loaded: {} file(s) to patch ({:.2} MiB compressed).",
+        entries.len(),
+        total_compressed as f64 / (1024.0 * 1024.0),
+    );
+    if entries.is_empty() {
+        println!("Nothing to download.");
+        return Ok(());
+    }
+
+    // ---- Progress bars ----
+    let mp = MultiProgress::new();
+    if !std::io::stdout().is_terminal() {
+        mp.set_draw_target(ProgressDrawTarget::hidden());
+    }
+    let total_pb = mp.add(ProgressBar::new(total_compressed));
+    total_pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+             {bytes}/{total_bytes} ({binary_bytes_per_sec}, ETA {eta})",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    total_pb.enable_steady_tick(Duration::from_millis(120));
+
+    // Reflect overall progress on the OS taskbar / dock (cleared on drop).
+    let mut _taskbar = crate::taskprogress::watch(total_pb.clone(), total_compressed);
+
+    let worker_bars: Vec<ProgressBar> = (0..PARALLEL_FILES.min(entries.len()))
+        .map(|_| {
+            let pb = mp.add(ProgressBar::new(0));
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "  [{bar:25.green/white}] {bytes:>10}/{total_bytes:>10} \
+                     ({binary_bytes_per_sec:>11}) {wide_msg}",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            pb.enable_steady_tick(Duration::from_millis(120));
+            pb
+        })
+        .collect();
+
+    // ---- Shared state ----
+    let counter = AtomicUsize::new(0);
+    let downloaded = AtomicUsize::new(0);
+    let failed_count = AtomicUsize::new(0);
+    let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let patches_dir = patchdata_dir.join("patches");
+
+    std::thread::scope(|scope| {
+        let entries = &entries;
+        let counter = &counter;
+        let downloaded = &downloaded;
+        let failed_count = &failed_count;
+        let failures = &failures;
+        let total_pb = &total_pb;
+        let agent = &agent;
+        let setup_base = &setup_base;
+        let patches_dir = &patches_dir;
+
+        for bar in worker_bars.iter().cloned() {
+            scope.spawn(move || {
+                loop {
+                    let idx = counter.fetch_add(1, Ordering::Relaxed);
+                    if idx >= entries.len() {
+                        break;
+                    }
+                    let entry = &entries[idx];
+
+                    bar.set_length(entry.compressed_size);
+                    bar.set_position(0);
+                    bar.set_message(entry.encoded_path.clone());
+
+                    let dest_path =
+                        patches_dir.join(format!("{}.nxdlpatch", entry.encoded_path));
+
+                    match download_ngm_patch_file(
+                        agent,
+                        setup_base,
+                        entry,
+                        &dest_path,
+                        &bar,
+                        total_pb,
+                    ) {
+                        Ok(()) => {
+                            downloaded.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            failed_count.fetch_add(1, Ordering::Relaxed);
+                            failures
+                                .lock()
+                                .unwrap()
+                                .push(format!("{}: {:#}", entry.encoded_path, e));
+                        }
+                    }
+                }
+                bar.finish_and_clear();
+            });
+        }
+    });
+
+    total_pb.finish_and_clear();
+    _taskbar.finish();
+
+    let downloaded = downloaded.load(Ordering::Relaxed);
+    let failed = failed_count.load(Ordering::Relaxed);
+
+    println!();
+    println!("Done: {downloaded} patch file(s) downloaded, {failed} failed.");
+
+    let failures = failures.into_inner().unwrap();
+    if !failures.is_empty() {
+        println!();
+        println!("Failed patch files:");
+        for f in &failures {
+            println!("  {f}");
+        }
+        bail!("{} patch file(s) failed to download", failures.len());
     }
 
     Ok(())

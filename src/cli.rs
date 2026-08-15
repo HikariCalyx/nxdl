@@ -32,13 +32,17 @@ pub struct Cli {
     #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 1..=2)]
     pub download: Option<Vec<String>>,
 
-    /// Patch an NXL client from its current version to a new version.
+    /// Patch a client from its current version to a new version.
     ///
-    /// Takes two values: `<MANIFEST_URL_OR_HASH>` (the target version's
-    /// `.manifest.hash` URL, a 40-character SHA-1 hex hash, or `latest` to
-    /// resolve via the branch API using the login session in `nxl.ini`) and
-    /// `<TARGET_PATH>` (the root client directory).
-    #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 2)]
+    /// For NXL games, takes two values: `<MANIFEST_URL_OR_HASH>` (the target
+    /// version's `.manifest.hash` URL, a 40-character SHA-1 hex hash, or
+    /// `latest` to resolve via the branch API using the login session in
+    /// `nxl.ini`) and `<TARGET_PATH>` (the root client directory).
+    ///
+    /// For NGM games, takes `<TARGET_PATH>` (the root client directory), or
+    /// `<MANIFEST_HASH_OR_LATEST> <TARGET_PATH>` to patch to a specific
+    /// manifest hash.  `latest` resolves the newest version from the NGM API.
+    #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 1..=2)]
     pub patch: Option<Vec<String>>,
 
     /// Check the client size and file count without downloading.
@@ -214,6 +218,20 @@ pub enum Commands {
         /// Download the client into the target path using the NGM API.
         #[arg(long, value_name = "TARGET_PATH")]
         download: Option<PathBuf>,
+
+        /// Patch the client to the latest version available from the NGM API,
+        /// or to a specific manifest hash.
+        ///
+        /// The current version is read from
+        /// `<TARGET_PATH>/<APPID>.manifest.hash` (written by `--download`).
+        /// Patch data is downloaded into `<TARGET_PATH>/patchdata/`.
+        ///
+        /// With one value (`<TARGET_PATH>`), the latest version is resolved
+        /// from the NGM API.  With two values
+        /// (`<MANIFEST_HASH_OR_LATEST> <TARGET_PATH>`), patches to the given
+        /// manifest hash; `latest` also resolves the newest version.
+        #[arg(long, value_names = ["MANIFEST_HASH_OR_LATEST", "TARGET_PATH"], num_args = 1..=2)]
+        patch: Option<Vec<String>>,
 
         /// Enable verbose output (lists files with `--check`).
         #[arg(short, long, action = clap::ArgAction::Count)]

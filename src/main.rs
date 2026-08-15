@@ -185,6 +185,7 @@ fn main() -> Result<()> {
                 appid,
                 check,
                 download,
+                patch,
                 verbose,
                 filter,
                 filter_regex,
@@ -237,8 +238,37 @@ fn main() -> Result<()> {
                         allow_insecure,
                         proxy,
                     )?;
+                } else if let Some(ref pa) = patch {
+                    let (manifest_source, target_path) = match pa.as_slice() {
+                        [target] => (None, std::path::PathBuf::from(target)),
+                        [manifest_source, target] => (
+                            Some(manifest_source.as_str()),
+                            std::path::PathBuf::from(target),
+                        ),
+                        _ => bail!(
+                            "--patch takes <TARGET_PATH> or \
+                             <MANIFEST_HASH_OR_LATEST> <TARGET_PATH>"
+                        ),
+                    };
+                    println!("  --patch");
+                    println!(
+                        "    manifest     = {}",
+                        manifest_source.unwrap_or("latest")
+                    );
+                    println!("    target_path  = {}", target_path.display());
+                    println!();
+                    ngm::patch_ngm(
+                        &resolved,
+                        manifest_source,
+                        &target_path,
+                        allow_insecure,
+                        proxy,
+                    )?;
                 } else {
-                    println!("  (no action specified; use --check or --download <TARGET_PATH>)");
+                    println!(
+                        "  (no action specified; use --check, --download <TARGET_PATH>, \
+                         or --patch <TARGET_PATH>)"
+                    );
                 }
                 return Ok(());
             }
@@ -419,27 +449,54 @@ fn main() -> Result<()> {
                     _ => unreachable!(),
                 }
             } else if let Some(ref pa) = cli.patch {
-                // --patch <MANIFEST_URL> <TARGET_PATH>  (NXL only)
                 if cli::is_ngm(raw_appid) {
-                    bail!("--patch is not supported for NGM games");
+                    // --patch [MANIFEST_HASH_OR_LATEST] <TARGET_PATH>  (NGM)
+                    let (manifest_source, target_path) = match pa.as_slice() {
+                        [target] => (None, std::path::PathBuf::from(target)),
+                        [manifest_source, target] => (
+                            Some(manifest_source.as_str()),
+                            std::path::PathBuf::from(target),
+                        ),
+                        _ => bail!(
+                            "--patch for NGM games takes <TARGET_PATH> or \
+                             <MANIFEST_HASH_OR_LATEST> <TARGET_PATH>"
+                        ),
+                    };
+                    println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
+                    println!("  --patch (NGM)");
+                    println!(
+                        "    manifest     = {}",
+                        manifest_source.unwrap_or("latest")
+                    );
+                    println!("    target_path  = {}", target_path.display());
+                    println!();
+                    ngm::patch_ngm(
+                        appid_str,
+                        manifest_source,
+                        &target_path,
+                        allow_insecure,
+                        proxy,
+                    )?;
+                } else {
+                    // --patch <MANIFEST_URL> <TARGET_PATH>  (NXL)
+                    let [manifest_source, target] = pa.as_slice() else {
+                        bail!("--patch requires exactly <MANIFEST_URL> <TARGET_PATH>");
+                    };
+                    let target_path = std::path::PathBuf::from(target);
+                    println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
+                    println!("  --patch");
+                    println!("    manifest_url = {manifest_source}");
+                    println!("    target_path  = {}", target_path.display());
+                    println!();
+                    nxl_patch::patch_client(
+                        manifest_source,
+                        appid_str,
+                        &target_path,
+                        allow_insecure,
+                        proxy,
+                        cli.keep_old_wz,
+                    )?;
                 }
-                let [manifest_source, target] = pa.as_slice() else {
-                    bail!("--patch requires exactly <MANIFEST_URL> <TARGET_PATH>");
-                };
-                let target_path = std::path::PathBuf::from(target);
-                println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
-                println!("  --patch");
-                println!("    manifest_url = {manifest_source}");
-                println!("    target_path  = {}", target_path.display());
-                println!();
-                nxl_patch::patch_client(
-                    manifest_source,
-                    appid_str,
-                    &target_path,
-                    allow_insecure,
-                    proxy,
-                    cli.keep_old_wz,
-                )?;
             } else {
                 println!("nxdl: appid = {} (raw: {})", appid, raw_appid);
                 println!(
