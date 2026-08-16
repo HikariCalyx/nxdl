@@ -30,19 +30,21 @@ old") and embed new bytes literally ("copy from patch").
 
 The patch is a sequential opcode stream. The decoder keeps:
 
-- a cursor into the **old file** (advanced by `0x04` and the seek ops),
+- a cursor into the **old file** (every copy op seeks to an explicit offset),
 - a sequential cursor into the **output file** (always advanced by writes).
 
 | Opcode | Arguments | Meaning |
 | ------ | --------- | ------- |
 | `0x00` | — | End of patch. The stream may also simply end at EOF without a terminator. |
-| `0x04` | `u8` (unused), `u16 count` | Copy `count` bytes from the old file at its **current position**. |
+| `0x04` | `u8 offset`, `u16 count` | Seek the old file to `offset`, copy `count` bytes. |
 | `0x10` | `u16 offset`, `u8 count` | Seek the old file to `offset`, copy `count` bytes. |
 | `0x14` | `u16 offset`, `u16 count` | Seek the old file to `offset`, copy `count` bytes. |
 | `0x20` | `u32 offset`, `u8 count` | Seek the old file to `offset`, copy `count` bytes. |
 | `0x24` | `u32 offset`, `u16 count` | Seek the old file to `offset`, copy `count` bytes. |
+| `0x28` | `u32 offset`, `u32 count` | Seek the old file to `offset`, copy `count` bytes. |
 | `0x40` | `u8 count` | Copy `count` literal bytes from the patch stream. |
 | `0x44` | `u16 count` | Copy `count` literal bytes from the patch stream. |
+| `0x48` | `u32 count` | Copy `count` literal bytes from the patch stream. |
 
 All integers are little-endian. Unknown opcodes must abort the patch.
 
@@ -55,13 +57,15 @@ while (patch_br.BaseStream.Position < patch_br.BaseStream.Length)
     if (opcode == 0) break;
     switch (opcode)
     {
-        case 0x04: /* u8 + u16 count */ from → to (current positions); break;
+        case 0x04: /* u8 offset + u16 count */ from.Seek(off); from → to; break;
         case 0x10: /* u16 offset + u8 count */  from.Seek(off); from → to; break;
         case 0x14: /* u16 offset + u16 count */ from.Seek(off); from → to; break;
         case 0x20: /* u32 offset + u8 count */  from.Seek(off); from → to; break;
         case 0x24: /* u32 offset + u16 count */ from.Seek(off); from → to; break;
+        case 0x28: /* u32 offset + u32 count */ from.Seek(off); from → to; break;
         case 0x40: /* u8 count */  patch → to; break;
         case 0x44: /* u16 count */ patch → to; break;
+        case 0x48: /* u32 count */ patch → to; break;
         default: throw;
     }
 }
@@ -94,3 +98,6 @@ while (patch_br.BaseStream.Position < patch_br.BaseStream.Length)
   obtained `.new` sample (e.g. embedded build-ID strings differ, which also
   changes the PE checksum). Validate a decoded patch by PE-checksum
   self-consistency rather than byte-equality with a sample file.
+
+## Credits
+@Deneo

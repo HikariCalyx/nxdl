@@ -1280,14 +1280,16 @@ fn seek_and_copy<R: std::io::Read + std::io::Seek, W: std::io::Write>(
 ///
 /// The patch is a stream of opcodes:
 /// - `0x00`: end of patch
-/// - `0x04`: u8 (unused), u16 count — copy `count` bytes from the old file
-///   at its current position
+/// - `0x04`: u8 offset, u16 count — copy `count` bytes from the old file
+///   at `offset`
 /// - `0x10`: u16 offset, u8 count — copy from the old file at `offset`
 /// - `0x14`: u16 offset, u16 count — copy from the old file at `offset`
 /// - `0x20`: u32 offset, u8 count — copy from the old file at `offset`
 /// - `0x24`: u32 offset, u16 count — copy from the old file at `offset`
+/// - `0x28`: u32 offset, u32 count — copy from the old file at `offset`
 /// - `0x40`: u8 count — copy `count` literal bytes from the patch
 /// - `0x44`: u16 count — copy `count` literal bytes from the patch
+/// - `0x48`: u32 count — copy `count` literal bytes from the patch
 fn apply_ngm_patch(old_path: &Path, patch_path: &Path, out_path: &Path) -> Result<()> {
     use std::io::{Read, Write};
 
@@ -1313,9 +1315,9 @@ fn apply_ngm_patch(old_path: &Path, patch_path: &Path, out_path: &Path) -> Resul
                 patch_file
                     .read_exact(&mut arg)
                     .context("truncated 0x04 opcode")?;
-                // arg[0] is unused.
+                let offset = arg[0] as u64;
                 let count = u16::from_le_bytes([arg[1], arg[2]]) as usize;
-                copy_bytes(&mut old_file, &mut out_file, &mut buf, count)
+                seek_and_copy(&mut old_file, &mut out_file, &mut buf, offset, count)
                     .context("0x04: copy from old file")?;
             }
             0x10 => {
@@ -1358,6 +1360,16 @@ fn apply_ngm_patch(old_path: &Path, patch_path: &Path, out_path: &Path) -> Resul
                 seek_and_copy(&mut old_file, &mut out_file, &mut buf, offset, count)
                     .context("0x24: copy from old file")?;
             }
+            0x28 => {
+                let mut arg = [0u8; 8];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x28 opcode")?;
+                let offset = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as u64;
+                let count = u32::from_le_bytes([arg[4], arg[5], arg[6], arg[7]]) as usize;
+                seek_and_copy(&mut old_file, &mut out_file, &mut buf, offset, count)
+                    .context("0x28: copy from old file")?;
+            }
             0x40 => {
                 let mut arg = [0u8; 1];
                 patch_file
@@ -1375,6 +1387,15 @@ fn apply_ngm_patch(old_path: &Path, patch_path: &Path, out_path: &Path) -> Resul
                 let count = u16::from_le_bytes(arg) as usize;
                 copy_bytes(&mut patch_file, &mut out_file, &mut buf, count)
                     .context("0x44: copy literal bytes from patch")?;
+            }
+            0x48 => {
+                let mut arg = [0u8; 4];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x48 opcode")?;
+                let count = u32::from_le_bytes(arg) as usize;
+                copy_bytes(&mut patch_file, &mut out_file, &mut buf, count)
+                    .context("0x48: copy literal bytes from patch")?;
             }
             other => bail!(
                 "unknown patch opcode 0x{other:02x} in {}",
