@@ -16,8 +16,10 @@
 //! 3. Download the patch manifest from `{setup_file_url}/{target}-{current}`
 //!    into `<target>/patchdata/patch_<target8>-<current8>.json`
 //! 4. Download, decompress, and concatenate the `.nxdelta` chunks of each
-//!    patched file into `<target>/patchdata/patches/<encoded>.nxdlpatch`
-//! 5. (TODO) Apply the patch files to the client.
+//!    patched file into `<target>/patchdata/patches/<decoded_path>.nxdlpatch`
+//! 5. Apply each `.nxdlpatch` to its target file: the patched result is
+//!    first written to `<target>/patchdata/applied/<path>`, then moved over
+//!    the original file and the patch file is deleted.
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read};
@@ -1158,6 +1160,8 @@ struct NgmPatchManifest {
 struct ResolvedNgmPatch {
     /// Base64-encoded file name (the manifest key, also the URL component).
     encoded_path: String,
+    /// Decoded, human-readable path (also the on-disk patch file name).
+    decoded_path: String,
     /// File-level SHA-1 hash (the `<total_hash>` component in chunk URLs).
     file_hash: String,
     /// Ordered list of `(chunk_id, chunk_hash)` sorted by chunk_id.
@@ -1219,7 +1223,7 @@ fn download_ngm_patch_file(
     if out.len() as u64 != entry.uncompressed_size {
         bail!(
             "patch size mismatch for {}: expected {}, got {}",
-            entry.encoded_path,
+            entry.decoded_path,
             entry.uncompressed_size,
             out.len()
         );
@@ -1227,6 +1231,207 @@ fn download_ngm_patch_file(
 
     std::fs::write(dest_path, &out)
         .with_context(|| format!("failed to write patch file {}", dest_path.display()))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Patch: applying .nxdlpatch files
+// ---------------------------------------------------------------------------
+
+/// Copy exactly `count` bytes from `src` to `dst`, using `buf` as scratch
+/// space.
+fn copy_bytes<R: std::io::Read, W: std::io::Write>(
+    src: &mut R,
+    dst: &mut W,
+    buf: &mut [u8],
+    count: usize,
+) -> Result<()> {
+    let mut remaining = count;
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len());
+        let n = src
+            .read(&mut buf[..chunk])
+            .context("unexpected end of input while copying")?;
+        if n == 0 {
+            bail!("unexpected end of input while copying {count} bytes");
+        }
+        dst.write_all(&buf[..n])
+            .context("failed to write output")?;
+        remaining -= n;
+    }
+    Ok(())
+}
+
+/// Seek `src` to `offset`, then copy `count` bytes from it to `dst`.
+fn seek_and_copy<R: std::io::Read + std::io::Seek, W: std::io::Write>(
+    src: &mut R,
+    dst: &mut W,
+    buf: &mut [u8],
+    offset: u64,
+    count: usize,
+) -> Result<()> {
+    src.seek(std::io::SeekFrom::Start(offset))
+        .with_context(|| format!("failed to seek to offset {offset}"))?;
+    copy_bytes(src, dst, buf, count)
+}
+
+/// Apply a single `.nxdlpatch` file to the old file, writing the result to
+/// `out_path`.
+///
+/// The patch is a stream of opcodes:
+/// - `0x00`: end of patch
+/// - `0x04`: u8 (unused), u16 count — copy `count` bytes from the old file
+///   at its current position
+/// - `0x10`: u16 offset, u8 count — copy from the old file at `offset`
+/// - `0x14`: u16 offset, u16 count — copy from the old file at `offset`
+/// - `0x20`: u32 offset, u8 count — copy from the old file at `offset`
+/// - `0x24`: u32 offset, u16 count — copy from the old file at `offset`
+/// - `0x40`: u8 count — copy `count` literal bytes from the patch
+/// - `0x44`: u16 count — copy `count` literal bytes from the patch
+fn apply_ngm_patch(old_path: &Path, patch_path: &Path, out_path: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let mut old_file = std::fs::File::open(old_path)
+        .with_context(|| format!("failed to open {}", old_path.display()))?;
+    let mut patch_file = std::fs::File::open(patch_path)
+        .with_context(|| format!("failed to open {}", patch_path.display()))?;
+    let mut out_file = std::fs::File::create(out_path)
+        .with_context(|| format!("failed to create {}", out_path.display()))?;
+
+    let mut buf = vec![0u8; 0x10000];
+
+    loop {
+        let mut op = [0u8; 1];
+        if patch_file.read(&mut op)? == 0 {
+            // The stream may simply end without an explicit 0x00 terminator.
+            break;
+        }
+        match op[0] {
+            0x00 => break,
+            0x04 => {
+                let mut arg = [0u8; 3];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x04 opcode")?;
+                // arg[0] is unused.
+                let count = u16::from_le_bytes([arg[1], arg[2]]) as usize;
+                copy_bytes(&mut old_file, &mut out_file, &mut buf, count)
+                    .context("0x04: copy from old file")?;
+            }
+            0x10 => {
+                let mut arg = [0u8; 3];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x10 opcode")?;
+                let offset = u16::from_le_bytes([arg[0], arg[1]]) as u64;
+                let count = arg[2] as usize;
+                seek_and_copy(&mut old_file, &mut out_file, &mut buf, offset, count)
+                    .context("0x10: copy from old file")?;
+            }
+            0x14 => {
+                let mut arg = [0u8; 4];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x14 opcode")?;
+                let offset = u16::from_le_bytes([arg[0], arg[1]]) as u64;
+                let count = u16::from_le_bytes([arg[2], arg[3]]) as usize;
+                seek_and_copy(&mut old_file, &mut out_file, &mut buf, offset, count)
+                    .context("0x14: copy from old file")?;
+            }
+            0x20 => {
+                let mut arg = [0u8; 5];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x20 opcode")?;
+                let offset = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as u64;
+                let count = arg[4] as usize;
+                seek_and_copy(&mut old_file, &mut out_file, &mut buf, offset, count)
+                    .context("0x20: copy from old file")?;
+            }
+            0x24 => {
+                let mut arg = [0u8; 6];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x24 opcode")?;
+                let offset = u32::from_le_bytes([arg[0], arg[1], arg[2], arg[3]]) as u64;
+                let count = u16::from_le_bytes([arg[4], arg[5]]) as usize;
+                seek_and_copy(&mut old_file, &mut out_file, &mut buf, offset, count)
+                    .context("0x24: copy from old file")?;
+            }
+            0x40 => {
+                let mut arg = [0u8; 1];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x40 opcode")?;
+                let count = arg[0] as usize;
+                copy_bytes(&mut patch_file, &mut out_file, &mut buf, count)
+                    .context("0x40: copy literal bytes from patch")?;
+            }
+            0x44 => {
+                let mut arg = [0u8; 2];
+                patch_file
+                    .read_exact(&mut arg)
+                    .context("truncated 0x44 opcode")?;
+                let count = u16::from_le_bytes(arg) as usize;
+                copy_bytes(&mut patch_file, &mut out_file, &mut buf, count)
+                    .context("0x44: copy literal bytes from patch")?;
+            }
+            other => bail!(
+                "unknown patch opcode 0x{other:02x} in {}",
+                patch_path.display()
+            ),
+        }
+    }
+
+    out_file.flush()?;
+    Ok(())
+}
+
+/// Apply one downloaded `.nxdlpatch` to the corresponding client file and
+/// move the result into place.
+///
+/// The patched file is first written to
+/// `<patchdata_dir>/applied/<rel_path>`; once complete, it overwrites
+/// `<target_dir>/<rel_path>`, and the `.nxdlpatch` file (named
+/// `<rel_path>.nxdlpatch` under `patches_dir`) is deleted.
+fn apply_and_install_patch(
+    target_dir: &Path,
+    patchdata_dir: &Path,
+    patches_dir: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    let old_path = target_dir.join(rel_path);
+    let patch_path = patches_dir.join(format!("{rel_path}.nxdlpatch"));
+    let applied_path = patchdata_dir.join("applied").join(rel_path);
+
+    if let Some(parent) = applied_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    apply_ngm_patch(&old_path, &patch_path, &applied_path)
+        .with_context(|| format!("failed to apply patch for {rel_path}"))?;
+
+    // Overwrite the target file with the patched result.
+    if let Some(parent) = old_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    std::fs::rename(&applied_path, &old_path).with_context(|| {
+        format!(
+            "failed to overwrite {} with {}",
+            old_path.display(),
+            applied_path.display()
+        )
+    })?;
+
+    // The patch file is no longer needed.
+    if let Err(e) = std::fs::remove_file(&patch_path) {
+        eprintln!(
+            "warning: failed to delete patch file {}: {e}",
+            patch_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1241,9 +1446,12 @@ fn download_ngm_patch_file(
 /// downloaded into
 /// `<target_dir>/patchdata/patch_<target8>-<current8>.json`, and the
 /// `.nxdelta` chunks of each patched file are downloaded, decompressed, and
-/// concatenated into `<target_dir>/patchdata/patches/<encoded>.nxdlpatch`.
-///
-/// Applying the patches to the client files is not implemented yet.
+/// concatenated into
+/// `<target_dir>/patchdata/patches/<decoded_path>.nxdlpatch`.
+/// Each patch is then applied: the patched file is staged in
+/// `<target_dir>/patchdata/applied/<path>` and then moved over the original
+/// file.  The patch file is deleted after it is applied.  On success the
+/// manifest hash file is updated.
 pub fn patch_ngm(
     appid: &str,
     manifest_source: Option<&str>,
@@ -1330,6 +1538,8 @@ pub fn patch_ngm(
     // ---- Step 4: resolve patch entries ----
     let mut entries: Vec<ResolvedNgmPatch> = Vec::with_capacity(patch_manifest.files.len());
     for (encoded_path, file_info) in &patch_manifest.files {
+        let decoded_path = decode_path(encoded_path)
+            .with_context(|| format!("failed to decode patch path {encoded_path}"))?;
         let mut chunks: Vec<(u32, String)> = file_info
             .objects
             .iter()
@@ -1337,18 +1547,19 @@ pub fn patch_ngm(
             .collect();
         chunks.sort_by_key(|(id, _)| *id);
         if chunks.is_empty() {
-            eprintln!("warning: skipping patch entry with no chunks: {encoded_path}");
+            eprintln!("warning: skipping patch entry with no chunks: {decoded_path}");
             continue;
         }
         entries.push(ResolvedNgmPatch {
             encoded_path: encoded_path.clone(),
+            decoded_path,
             file_hash: file_info.hash.clone(),
             chunks,
             uncompressed_size: file_info.uncompressed_size,
             compressed_size: file_info.compressed_size,
         });
     }
-    entries.sort_by(|a, b| a.encoded_path.cmp(&b.encoded_path));
+    entries.sort_by(|a, b| a.decoded_path.cmp(&b.decoded_path));
 
     let total_compressed: u64 = entries.iter().map(|e| e.compressed_size).sum();
     println!(
@@ -1425,10 +1636,10 @@ pub fn patch_ngm(
 
                     bar.set_length(entry.compressed_size);
                     bar.set_position(0);
-                    bar.set_message(entry.encoded_path.clone());
+                    bar.set_message(entry.decoded_path.clone());
 
                     let dest_path =
-                        patches_dir.join(format!("{}.nxdlpatch", entry.encoded_path));
+                        patches_dir.join(format!("{}.nxdlpatch", entry.decoded_path));
 
                     match download_ngm_patch_file(
                         agent,
@@ -1446,7 +1657,7 @@ pub fn patch_ngm(
                             failures
                                 .lock()
                                 .unwrap()
-                                .push(format!("{}: {:#}", entry.encoded_path, e));
+                                .push(format!("{}: {:#}", entry.decoded_path, e));
                         }
                     }
                 }
@@ -1474,5 +1685,126 @@ pub fn patch_ngm(
         bail!("{} patch file(s) failed to download", failures.len());
     }
 
+    // ---- Step 5: apply the downloaded patches ----
+    let apply_entries: Vec<String> = entries
+        .iter()
+        .map(|e| e.decoded_path.clone())
+        .collect();
+
+    let applied = AtomicUsize::new(0);
+    let apply_failed = AtomicUsize::new(0);
+    let apply_failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let counter = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        let apply_entries = &apply_entries;
+        let counter = &counter;
+        let applied = &applied;
+        let apply_failed = &apply_failed;
+        let apply_failures = &apply_failures;
+        let patchdata_dir = &patchdata_dir;
+        let patches_dir = &patches_dir;
+
+        for _ in 0..PARALLEL_FILES.min(apply_entries.len()) {
+            scope.spawn(move || {
+                loop {
+                    let idx = counter.fetch_add(1, Ordering::Relaxed);
+                    if idx >= apply_entries.len() {
+                        break;
+                    }
+                    let rel_path = &apply_entries[idx];
+                    match apply_and_install_patch(
+                        target_dir,
+                        patchdata_dir,
+                        patches_dir,
+                        rel_path,
+                    ) {
+                        Ok(()) => {
+                            applied.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            apply_failed.fetch_add(1, Ordering::Relaxed);
+                            apply_failures
+                                .lock()
+                                .unwrap()
+                                .push(format!("{rel_path}: {e:#}"));
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let applied = applied.load(Ordering::Relaxed);
+    let apply_failed = apply_failed.load(Ordering::Relaxed);
+
+    println!();
+    println!("Patched: {applied} file(s) applied, {apply_failed} failed.");
+
+    let apply_failures = apply_failures.into_inner().unwrap();
+    if !apply_failures.is_empty() {
+        println!();
+        println!("Failed patch applications:");
+        for f in &apply_failures {
+            println!("  {f}");
+        }
+        bail!("{} patch file(s) failed to apply", apply_failures.len());
+    }
+
+    // ---- Step 6: record the new version ----
+    write_manifest_hash(target_dir, appid, dst_hash)?;
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_reference_patch() {
+        let base = Path::new("reference");
+        let old = base.join("Maplestory_Classic.exe.old");
+        let patch = base.join("TWFwbGVzdG9yeV9DbGFzc2ljLmV4ZQ==.nxdlpatch");
+        let out = base.join("Maplestory_Classic.exe.verified");
+        if !old.exists() || !patch.exists() {
+            // Reference fixtures are not always checked out.
+            return;
+        }
+        apply_ngm_patch(&old, &patch, &out).unwrap();
+
+        let data = std::fs::read(&out).unwrap();
+        // Size must match the old file.
+        assert_eq!(
+            data.len(),
+            std::fs::metadata(&old).unwrap().len() as usize,
+            "patched size mismatch"
+        );
+        // The decoded PE must be self-consistent: its stored CheckSum field
+        // must equal the checksum computed over the file (with the field
+        // zeroed).
+        let lfa = u32::from_le_bytes(data[0x3C..0x40].try_into().unwrap()) as usize;
+        let csum_off = lfa + 4 + 20 + 64;
+        let stored = u32::from_le_bytes(data[csum_off..csum_off + 4].try_into().unwrap());
+        let mut b = data;
+        b[csum_off..csum_off + 4].copy_from_slice(&[0, 0, 0, 0]);
+        let mut s: u64 = 0;
+        let mut i = 0;
+        while i + 1 < b.len() {
+            s += u16::from_le_bytes([b[i], b[i + 1]]) as u64;
+            s = (s & 0xFFFF) + (s >> 16);
+            i += 2;
+        }
+        if i < b.len() {
+            s += b[i] as u64;
+        }
+        s = (s & 0xFFFF) + (s >> 16);
+        let computed = (s + b.len() as u64) & 0xFFFF_FFFF;
+        assert_eq!(
+            computed as u32, stored,
+            "decoded PE checksum does not match stored checksum"
+        );
+
+        let _ = std::fs::remove_file(&out);
+    }
 }
