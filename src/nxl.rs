@@ -222,7 +222,8 @@ pub fn fetch_manifest(
 ///
 /// The keys in the `files` object are Base64 strings whose decoded bytes form
 /// a UTF-16LE string.  The first character is typically a BOM (`\u{FEFF}`)
-/// which is stripped.
+/// which is stripped.  Windows-style `\` separators are normalised to `/` —
+/// see [`crate::relpath`] for why.
 pub fn decode_file_path(encoded: &str) -> Result<String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
@@ -241,8 +242,9 @@ pub fn decode_file_path(encoded: &str) -> Result<String> {
     // Strip leading BOM if present.
     let start = if u16s.first() == Some(&0xFEFF) { 1 } else { 0 };
 
-    String::from_utf16(&u16s[start..])
-        .context("failed to decode UTF-16 file path")
+    let path = String::from_utf16(&u16s[start..])
+        .context("failed to decode UTF-16 file path")?;
+    Ok(crate::relpath::normalize(&path))
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +361,7 @@ pub fn download_client(
 
         // Handle directories eagerly (they're cheap).
         if file_info.objects.len() == 1 && file_info.objects[0] == "__DIR__" {
-            let dir_path = appdata_dir.join(&rel_path);
+            let dir_path = crate::relpath::join(&appdata_dir, &rel_path);
             if let Err(e) = std::fs::create_dir_all(&dir_path) {
                 eprintln!("warning: failed to create directory {}: {e}", dir_path.display());
             } else {
@@ -462,7 +464,7 @@ pub fn download_client(
                     bar.set_position(0);
                     bar.set_message(entry.rel_path.clone());
 
-                    let dest_path = appdata_dir.join(&entry.rel_path);
+                    let dest_path = crate::relpath::join(appdata_dir, &entry.rel_path);
 
                     match download_one_file(
                         agent,

@@ -207,13 +207,15 @@ struct NgmManifest {
 /// Decode a Base64-encoded file path (UTF-8) from the NGM manifest.
 ///
 /// The keys in the `files` object are Base64 strings whose decoded bytes form
-/// a UTF-8 path.  Backslashes are used as path separators.
+/// a UTF-8 path.  Backslashes are used as path separators, so the result is
+/// normalised to `/` — see [`crate::relpath`] for why.
 fn decode_path(encoded: &str) -> Result<String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .context("failed to base64-decode file path")?;
 
-    String::from_utf8(bytes).context("failed to decode file path as UTF-8")
+    let path = String::from_utf8(bytes).context("failed to decode file path as UTF-8")?;
+    Ok(crate::relpath::normalize(&path))
 }
 
 // ---------------------------------------------------------------------------
@@ -957,7 +959,7 @@ pub fn download_ngm(
                     .next()
                     .map_or(false, |v| v == "__DIR__"))
         {
-            let dir_path = target_dir.join(&rel_path);
+            let dir_path = crate::relpath::join(target_dir, &rel_path);
             if let Err(e) = std::fs::create_dir_all(&dir_path) {
                 eprintln!("warning: failed to create directory {}: {e}", dir_path.display());
             } else {
@@ -1066,7 +1068,7 @@ pub fn download_ngm(
                     bar.set_position(0);
                     bar.set_message(entry.rel_path.clone());
 
-                    let dest_path = target_dir.join(&entry.rel_path);
+                    let dest_path = crate::relpath::join(target_dir, &entry.rel_path);
 
                     match download_ngm_one_file(
                         agent,
@@ -1421,9 +1423,10 @@ fn apply_and_install_patch(
     patches_dir: &Path,
     rel_path: &str,
 ) -> Result<()> {
-    let old_path = target_dir.join(rel_path);
-    let patch_path = patches_dir.join(format!("{rel_path}.nxdlpatch"));
-    let applied_path = patchdata_dir.join("applied").join(rel_path);
+    let old_path = crate::relpath::join(target_dir, rel_path);
+    let patch_path = crate::relpath::join_with_suffix(patches_dir, rel_path, ".nxdlpatch");
+    let applied_path =
+        crate::relpath::join(&patchdata_dir.join("applied"), rel_path);
 
     if let Some(parent) = applied_path.parent() {
         std::fs::create_dir_all(parent)
@@ -1659,8 +1662,11 @@ pub fn patch_ngm(
                     bar.set_position(0);
                     bar.set_message(entry.decoded_path.clone());
 
-                    let dest_path =
-                        patches_dir.join(format!("{}.nxdlpatch", entry.decoded_path));
+                    let dest_path = crate::relpath::join_with_suffix(
+                        patches_dir,
+                        &entry.decoded_path,
+                        ".nxdlpatch",
+                    );
 
                     match download_ngm_patch_file(
                         agent,

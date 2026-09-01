@@ -6,6 +6,7 @@ mod net;
 mod ngm;
 mod nxl;
 mod nxl_patch;
+mod relpath;
 mod resume;
 mod taskprogress;
 

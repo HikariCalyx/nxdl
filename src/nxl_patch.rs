@@ -407,7 +407,7 @@ fn mark_completed(writer: &Mutex<std::fs::File>, rel_path: &str) -> std::io::Res
 /// Remove empty parent directories of `rel_path` under `patched_dir`, walking
 /// upward until a non-empty directory is hit or we reach `patched_dir` itself.
 fn remove_empty_parents(patched_dir: &Path, rel_path: &str) {
-    let mut current = patched_dir.join(rel_path);
+    let mut current = crate::relpath::join(patched_dir, rel_path);
     // Strip the filename to get the file's parent directory.
     current.pop();
     while current != patched_dir {
@@ -426,8 +426,8 @@ fn move_to_appdata(
     appdata_dir: &Path,
     rel_path: &str,
 ) -> Result<()> {
-    let src = patched_dir.join(rel_path);
-    let dst = appdata_dir.join(rel_path);
+    let src = crate::relpath::join(patched_dir, rel_path);
+    let dst = crate::relpath::join(appdata_dir, rel_path);
 
     // Create destination parent directories.
     if let Some(parent) = dst.parent() {
@@ -516,12 +516,12 @@ fn check_is_maplestory(appdata_dir: &Path) -> bool {
 /// from the normal `appdata/` location.
 fn old_file_path_for_patch(appdata_dir: &Path, rel_path: &str, keep_old_wz: bool) -> PathBuf {
     if keep_old_wz {
-        let normalized = rel_path.replace('\\', "/");
+        let normalized = crate::relpath::normalize(rel_path);
         if let Some(rest) = normalized.strip_prefix("Data/") {
-            return appdata_dir.join("DataBk").join(rest);
+            return crate::relpath::join(&appdata_dir.join("DataBk"), rest);
         }
     }
-    appdata_dir.join(rel_path)
+    crate::relpath::join(appdata_dir, rel_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -640,7 +640,7 @@ fn patch_one_file(
         .with_context(|| format!("failed to apply diff for '{}'", entry.path))?;
 
     // Write the patched file to `patchdata/patched/<path>`.
-    let dest = patched_dir.join(&entry.path);
+    let dest = crate::relpath::join(patched_dir, &entry.path);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory '{}'", parent.display()))?;
@@ -1037,7 +1037,7 @@ pub fn patch_client(
                             bar.set_position(0);
                             bar.set_message(entry.path.clone());
 
-                            let dest = patched_dir.join(&entry.path);
+                            let dest = crate::relpath::join(patched_dir, &entry.path);
                             match fallback_download_file(
                                 ag,
                                 base_url,
@@ -1113,7 +1113,7 @@ pub fn patch_client(
     let mut move_fail: usize = 0;
 
     for rel_path in &all_completed {
-        let src = patched_dir.join(rel_path);
+        let src = crate::relpath::join(&patched_dir, rel_path);
         if !src.exists() {
             continue; // already moved earlier — skip silently.
         }
