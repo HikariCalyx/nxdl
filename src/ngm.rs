@@ -1,4 +1,11 @@
-//! NGM (NX Game Manager) client check logic.
+//! NGM (NX Game Manager) client check / download / patch logic.
+//!
+//! Games whose game-info response carries a `manifest_name` use the per-file
+//! patch protocol below.  Games without one (e.g. KMS `589825`, Mabinogi JP
+//! `16785925`) ship as a *setup package*: `setup_file_url` points at a
+//! `.sting` or `.nfo` manifest that describes a full-client download split
+//! into numbered parts, which are downloaded as-is (see the "Setup packages"
+//! section further down).
 //!
 //! Protocol:
 //! 1. Fetch game info from `https://ngmapi.nexon.com/game-info/{appid}`
@@ -418,25 +425,10 @@ pub fn check_ngm(
     let manifest_name = match &info.manifest_name {
         Some(name) => name,
         None => {
-            if json {
-                let result = CheckResult {
-                    appid: appid.to_owned(),
-                    game_name: info.game_name.clone(),
-                    manifest_url: String::new(),
-                    last_modified: None,
-                    files_in_manifest: 0,
-                    files_to_download: 0,
-                    total_size: 0,
-                    client_version: None,
-                };
-                println!("{}", serde_json::to_string(&result)?);
-            } else {
-                println!();
-                println!("  game:      {}", info.game_name);
-                println!("  product:   {appid}");
-                println!("  (no manifest available)");
-            }
-            return Ok(());
+            // No per-file patch manifest: `setup_file_url` points at a setup
+            // package manifest (`.sting` / `.nfo`) that describes a
+            // full-client download.  Check that instead.
+            return check_ngm_setup(appid, &info, verbose, json, &agent);
         }
     };
     let setup_base = info.setup_file_url.trim_end_matches('/');
@@ -588,37 +580,653 @@ pub fn check_ngm(
 }
 
 // ---------------------------------------------------------------------------
+// Setup packages (.sting / .nfo) — full-client downloads with no manifest
+// ---------------------------------------------------------------------------
+//
+// Some NGM games (e.g. KMS `589825`, Mabinogi JP `16785925`) have no
+// `manifest_name` in the game-info response.  For those, `setup_file_url`
+// points directly at a *setup package* manifest that describes a full-client
+// download split into numbered parts:
+//
+// - `.sting` — a JSON document describing `compressed_file_count` parts named
+//   `<sting_name>.pegNN`.
+// - `.nfo`   — a legacy NFO file listing `<name>.zNN` split archives.
+//
+// The parts are downloaded as-is into the target directory; decompressing /
+// extracting them into the final game tree is not implemented yet.
+
+/// JSON output for `--check --json` on a setup-package (no-manifest) game.
+#[derive(serde::Serialize)]
+struct SetupCheckResult {
+    appid: String,
+    game_name: String,
+    /// `"sting"` or `"nfo"`.
+    manifest_type: &'static str,
+    manifest_url: String,
+    /// Release/build date as Unix seconds when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_date: Option<i64>,
+    /// Number of parts to download.
+    archive_count: usize,
+    /// Total number of bytes that will be downloaded.
+    total_size: u64,
+    /// Installed (uncompressed) size, when the sting declares it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_size: Option<u64>,
+    /// Base part name from the sting (e.g. "maplestory" → `maplestory.peg00`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sting_name: Option<String>,
+}
+
+/// Lower-cased file extension (without the dot) of `url`, if its path has one.
+fn url_extension(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let (stem, ext) = name.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() {
+        return None;
+    }
+    Some(ext.to_ascii_lowercase())
+}
+
+/// Directory portion of `url` — everything up to, but not including, the
+/// final `/`-separated segment — with no trailing slash.
+fn url_base_dir(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(idx) => trimmed[..idx].to_owned(),
+        None => trimmed.to_owned(),
+    }
+}
+
+/// Contents of a `.sting` setup manifest (JSON).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct StingInfo {
+    #[serde(default)]
+    version: Option<i64>,
+    /// Build time as Unix seconds.
+    #[serde(default)]
+    time_stamp: Option<i64>,
+    /// Total uncompressed (installed) size in bytes.
+    #[serde(default)]
+    original_size: Option<u64>,
+    /// Total compressed size of all `.peg` parts in bytes.
+    #[serde(default)]
+    compressed_size: Option<u64>,
+    /// Base name of the `.pegNN` parts (e.g. "maplestory").
+    sting_name: String,
+    /// Number of `.pegNN` parts.
+    compressed_file_count: u32,
+}
+
+impl StingInfo {
+    /// Names of the numbered parts: `<sting_name>.peg00` … `.pegNN`.
+    fn part_files(&self) -> Vec<String> {
+        (0..self.compressed_file_count)
+            .map(|i| format!("{}.peg{:02}", self.sting_name, i))
+            .collect()
+    }
+}
+
+/// One archive listed in an `.nfo` setup manifest.
+#[derive(Debug, Clone)]
+struct NfoPart {
+    /// Archive file name, e.g. `Mabinogi.z00`.
+    name: String,
+    /// Byte size.
+    size: u64,
+}
+
+/// Parse a legacy `.nfo` setup manifest:
+///
+/// ```text
+/// NFO300,9526927360; DO NOT edit this line manually
+/// "Mabinogi.z00","819766191","3145492277"
+/// "Mabinogi.z01","-1532145412","3142701016"
+/// ```
+///
+/// The first line is a header; every other line holds three comma-separated,
+/// double-quoted fields: file name, CRC-32 (signed), and byte size.
+fn parse_nfo(content: &str) -> Result<Vec<NfoPart>> {
+    let mut parts = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("NFO") || !line.starts_with('"') {
+            continue;
+        }
+        let fields: Vec<&str> = line.trim_matches('"').split("\",\"").collect();
+        if fields.len() != 3 {
+            bail!("malformed NFO entry (expected 3 fields): {line}");
+        }
+        let name = fields[0].trim().to_owned();
+        if name.is_empty() {
+            bail!("NFO entry with an empty archive name: {line}");
+        }
+        let size: u64 = fields[2]
+            .trim()
+            .parse()
+            .with_context(|| format!("invalid archive size in NFO entry: {line}"))?;
+        parts.push(NfoPart { name, size });
+    }
+    if parts.is_empty() {
+        bail!("no archives listed in the NFO file");
+    }
+    Ok(parts)
+}
+
+/// One file part of a setup-package download.
+#[derive(Debug, Clone)]
+struct SetupPart {
+    /// File name under the target directory (e.g. `maplestory.peg03`).
+    filename: String,
+    /// Absolute download URL.
+    url: String,
+    /// Expected byte size when known (from the NFO, or a HEAD request).
+    size: Option<u64>,
+}
+
+/// A parsed setup package (`.sting` or `.nfo`).
+#[derive(Debug)]
+struct SetupPackage {
+    /// `"sting"` or `"nfo"`.
+    format: &'static str,
+    /// Source manifest URL (the `setup_file_url`).
+    url: String,
+    /// Parts to download, in order.
+    parts: Vec<SetupPart>,
+    /// Raw HTTP `Last-Modified` value (NFO only) — shown to the user.
+    release_date_raw: Option<String>,
+    /// Release/build date as Unix seconds when derivable (the NFO's
+    /// `Last-Modified` header, or the sting's `time_stamp`).
+    release_date: Option<i64>,
+    /// Parsed sting metadata, when the package is a `.sting`.
+    sting: Option<StingInfo>,
+}
+
+/// Fetch and parse the setup package that `setup_file_url` points at.
+///
+/// The package type is chosen by the extension of `setup_file_url`: `.sting`
+/// or `.nfo`.  Anything else fails with "Unknown manifest type : <ext>".
+fn fetch_setup_package(agent: &ureq::Agent, setup_file_url: &str) -> Result<SetupPackage> {
+    let ext = url_extension(setup_file_url)
+        .ok_or_else(|| anyhow!("cannot determine manifest type from URL: {setup_file_url}"))?;
+    let base_url = url_base_dir(setup_file_url);
+
+    match ext.as_str() {
+        "sting" => {
+            let json = http_get_string(agent, setup_file_url).with_context(|| {
+                format!("failed to fetch sting manifest from {setup_file_url}")
+            })?;
+            let sting: StingInfo = serde_json::from_str(&json)
+                .context("failed to parse sting manifest JSON")?;
+            if sting.sting_name.is_empty() {
+                bail!("sting manifest has an empty sting_name");
+            }
+            let parts = sting
+                .part_files()
+                .into_iter()
+                .map(|filename| SetupPart {
+                    url: format!("{base_url}/{filename}"),
+                    filename,
+                    size: None,
+                })
+                .collect();
+            Ok(SetupPackage {
+                format: "sting",
+                url: setup_file_url.to_owned(),
+                parts,
+                release_date_raw: None,
+                release_date: sting.time_stamp,
+                sting: Some(sting),
+            })
+        }
+        "nfo" => {
+            let (content, last_modified) =
+                http_get_string_with_modified(agent, setup_file_url).with_context(|| {
+                    format!("failed to fetch NFO manifest from {setup_file_url}")
+                })?;
+            let parts = parse_nfo(&content)?
+                .into_iter()
+                .map(|p| SetupPart {
+                    url: format!("{base_url}/{}", p.name),
+                    filename: p.name,
+                    size: Some(p.size),
+                })
+                .collect();
+            Ok(SetupPackage {
+                format: "nfo",
+                url: setup_file_url.to_owned(),
+                parts,
+                release_date_raw: last_modified.clone(),
+                release_date: last_modified.as_deref().and_then(parse_http_date),
+                sting: None,
+            })
+        }
+        other => bail!("Unknown manifest type : {other}"),
+    }
+}
+
+/// Total compressed bytes of a setup package: the sum of the part sizes when
+/// every part has one (NFO, or fully-resolved sting parts), otherwise the
+/// sting's declared `compressed_size`.
+fn setup_total_size(package: &SetupPackage) -> u64 {
+    let known_count = package.parts.iter().filter(|p| p.size.is_some()).count();
+    if known_count == package.parts.len() && known_count > 0 {
+        return package.parts.iter().filter_map(|p| p.size).sum();
+    }
+    package
+        .sting
+        .as_ref()
+        .and_then(|s| s.compressed_size)
+        .unwrap_or_else(|| package.parts.iter().filter_map(|p| p.size).sum())
+}
+
+/// Check a setup-package game (no `manifest_name`): fetch the `.sting`/`.nfo`
+/// manifest from `setup_file_url` and print a summary of the parts.
+fn check_ngm_setup(
+    appid: &str,
+    info: &GameInfo,
+    verbose: bool,
+    json: bool,
+    agent: &ureq::Agent,
+) -> Result<()> {
+    let package = fetch_setup_package(agent, &info.setup_file_url)?;
+    let archive_count = package.parts.len();
+    let total_size = setup_total_size(&package);
+
+    if json {
+        let result = SetupCheckResult {
+            appid: appid.to_owned(),
+            game_name: info.game_name.clone(),
+            manifest_type: package.format,
+            manifest_url: package.url.clone(),
+            release_date: package.release_date,
+            archive_count,
+            total_size,
+            original_size: package.sting.as_ref().and_then(|s| s.original_size),
+            sting_name: package.sting.as_ref().map(|s| s.sting_name.clone()),
+        };
+        println!("{}", serde_json::to_string(&result)?);
+    } else {
+        println!();
+        println!("  game:           {}", info.game_name);
+        println!("  product:        {appid}");
+        println!("  setup type:     {} ({})", package.format, package.url);
+        if let Some(ref raw) = package.release_date_raw {
+            println!("  release date:   {raw}");
+        }
+        if let Some(ref sting) = package.sting {
+            if let Some(v) = sting.version {
+                println!("  version:        {v}");
+            }
+            if let Some(ts) = sting.time_stamp {
+                println!("  time stamp:     {ts}");
+            }
+            if let Some(os) = sting.original_size {
+                println!(
+                    "  installed size: {:.2} GiB ({} bytes)",
+                    os as f64 / (1024.0 * 1024.0 * 1024.0),
+                    format_bytes(os),
+                );
+            }
+        }
+        println!("  parts:          {archive_count}");
+        println!(
+            "  total size:     {:.2} GiB ({} bytes)",
+            total_size as f64 / (1024.0 * 1024.0 * 1024.0),
+            format_bytes(total_size),
+        );
+
+        if verbose && archive_count > 0 {
+            println!();
+            println!("{:<40} {:>16}", "PART", "SIZE");
+            println!("{:-<40} {:-<16}", "", "");
+            for part in &package.parts {
+                let size = match part.size {
+                    Some(s) => human_size(s),
+                    None => "?".to_owned(),
+                };
+                println!("{:<40} {:>16}", part.filename, size);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Path of the temporary partial file used while downloading a setup part.
+fn part_path(dest: &Path) -> std::path::PathBuf {
+    let mut s = dest.as_os_str().to_owned();
+    s.push(".part");
+    std::path::PathBuf::from(s)
+}
+
+/// Download one whole setup part into `dest_path`, resuming from the bytes
+/// already staged in `dest_path.part`.
+///
+/// The body is streamed to disk (parts can be several GiB), so a transient
+/// failure resumes from where it left off via an HTTP `Range` request.  When
+/// the server ignores the range (it replies `200` to our `Range` request) the
+/// partial file is discarded and the part is re-downloaded from scratch.
+/// Returns `Ok(true)` when bytes were downloaded and `Ok(false)` when the
+/// destination already held the full expected size.
+fn download_setup_part(
+    agent: &ureq::Agent,
+    url: &str,
+    dest_path: &Path,
+    expected_size: Option<u64>,
+    worker_bar: &ProgressBar,
+    total_bar: &ProgressBar,
+) -> Result<bool> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    // Already complete → nothing to download.
+    if let Some(expected) = expected_size {
+        if dest_path.exists()
+            && dest_path.metadata().map_or(false, |m| m.len() == expected)
+        {
+            worker_bar.set_length(expected);
+            worker_bar.set_position(expected);
+            total_bar.inc(expected);
+            return Ok(false);
+        }
+    }
+
+    let part_file = part_path(dest_path);
+
+    // Resume from whatever the partial file already holds.
+    let mut offset = part_file.metadata().map(|m| m.len()).unwrap_or(0);
+    if let Some(expected) = expected_size {
+        if offset == expected {
+            // A previous run finished writing the partial but was interrupted
+            // before renaming it into place — just move it now.
+            std::fs::rename(&part_file, dest_path).with_context(|| {
+                format!(
+                    "failed to move {} into place as {}",
+                    part_file.display(),
+                    dest_path.display()
+                )
+            })?;
+            worker_bar.set_length(expected);
+            worker_bar.set_position(expected);
+            total_bar.inc(expected);
+            return Ok(true);
+        }
+        if offset > expected {
+            // The partial is longer than the real file — start over.
+            let _ = std::fs::remove_file(&part_file);
+            offset = 0;
+        }
+    }
+
+    worker_bar.set_length(expected_size.unwrap_or(0));
+    worker_bar.set_position(offset);
+    worker_bar.set_message(
+        dest_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| url.to_owned()),
+    );
+
+    const MAX_ATTEMPTS: usize = 8;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&part_file)
+            .with_context(|| format!("failed to open {}", part_file.display()))?;
+        // Truncate when starting fresh; otherwise just seek to the resume
+        // point (the partial already contains `offset` good bytes).
+        file.set_len(offset)
+            .with_context(|| format!("failed to size {}", part_file.display()))?;
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| "seek failed")?;
+
+        // Ask for the remainder when resuming.
+        let mut req = agent.get(url);
+        if offset > 0 {
+            req = req.set("Range", &format!("bytes={offset}-"));
+        }
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow!("HTTP request failed: {e}"));
+                drop(file);
+                continue; // retry from the same offset
+            }
+        };
+
+        let status = resp.status();
+        if offset > 0 && status == 200 {
+            // The server ignored our Range header and sent the whole file.
+            drop(file);
+            let _ = std::fs::remove_file(&part_file);
+            offset = 0;
+            continue; // restart from scratch
+        }
+        if status != 200 && status != 206 {
+            drop(file);
+            bail!("unexpected HTTP status {status} while downloading {url}");
+        }
+
+        // Stream the remainder of the body to disk.
+        let mut reader = resp.into_reader();
+        let mut buf = [0u8; 256 * 1024];
+        let mut complete = false;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => {
+                    complete = true;
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(e) = file.write_all(&buf[..n]) {
+                        last_err = Some(e.into());
+                        break;
+                    }
+                    offset += n as u64;
+                    worker_bar.inc(n as u64);
+                    total_bar.inc(n as u64);
+                }
+                Err(e) => {
+                    last_err = Some(e.into());
+                    break;
+                }
+            }
+        }
+        drop(file);
+
+        if !complete {
+            continue; // retry from the (updated) offset
+        }
+
+        if let Some(expected) = expected_size {
+            if offset != expected {
+                last_err = Some(anyhow!(
+                    "size mismatch for {}: expected {expected} bytes, got {offset}",
+                    dest_path.display()
+                ));
+                continue; // resume from `offset` to fetch the remainder
+            }
+        }
+
+        std::fs::rename(&part_file, dest_path).with_context(|| {
+            format!(
+                "failed to move {} into place as {}",
+                part_file.display(),
+                dest_path.display()
+            )
+        })?;
+        return Ok(true);
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to download {url}")))
+}
+
+/// Download a setup-package client (no `manifest_name`): fetch the
+/// `.sting`/`.nfo` manifest from `setup_file_url` and download every numbered
+/// part into `target_dir`.
+///
+/// Decompressing / extracting the parts into the final game tree is not
+/// implemented yet.
+fn download_ngm_setup(
+    appid: &str,
+    target_dir: &Path,
+    info: &GameInfo,
+    agent: &ureq::Agent,
+) -> Result<()> {
+    let mut package = fetch_setup_package(agent, &info.setup_file_url)?;
+
+    // The `.sting` format does not list per-part sizes, so ask each server for
+    // its `Content-Length` (best-effort) to show accurate progress.
+    for part in package.parts.iter_mut().filter(|p| p.size.is_none()) {
+        if let Ok(resp) = agent.head(&part.url).call() {
+            part.size = resp
+                .header("Content-Length")
+                .and_then(|s| s.parse::<u64>().ok());
+        }
+    }
+
+    let archive_count = package.parts.len();
+    let total_size = setup_total_size(&package);
+    let unknown = package.parts.iter().filter(|p| p.size.is_none()).count();
+
+    println!("Game:         {}", info.game_name);
+    println!("Product:      {appid}");
+    println!("Setup type:   {}", package.format);
+    println!("Setup file:   {}", package.url);
+    if let Some(ref raw) = package.release_date_raw {
+        println!("Release date: {raw}");
+    }
+    if let Some(ref sting) = package.sting {
+        if let Some(ts) = sting.time_stamp {
+            println!("Time stamp:   {ts}");
+        }
+    }
+    println!("Parts:        {archive_count}");
+    if unknown > 0 {
+        println!("  (size of {unknown} part(s) unknown)");
+    }
+    println!(
+        "Total size:   {:.2} GiB ({} bytes)",
+        total_size as f64 / (1024.0 * 1024.0 * 1024.0),
+        format_bytes(total_size),
+    );
+    if archive_count == 0 {
+        println!("Nothing to download.");
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(target_dir).with_context(|| {
+        format!(
+            "failed to create target directory {}",
+            target_dir.display()
+        )
+    })?;
+
+    // ---- Progress bars ----
+    let mp = MultiProgress::new();
+    // Hide bars when stdout is not a terminal (piped / redirected).
+    if !std::io::stdout().is_terminal() {
+        mp.set_draw_target(ProgressDrawTarget::hidden());
+    }
+    let total_pb = mp.add(ProgressBar::new(total_size));
+    total_pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+             {bytes}/{total_bytes} ({binary_bytes_per_sec}, ETA {eta})",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    total_pb.enable_steady_tick(Duration::from_millis(120));
+
+    // Reflect overall progress on the OS taskbar / dock (cleared on drop).
+    let mut _taskbar = crate::taskprogress::watch(total_pb.clone(), total_size);
+
+    let worker_pb = mp.add(ProgressBar::new(0));
+    worker_pb.set_style(
+        ProgressStyle::with_template(
+            "  [{bar:25.green/white}] {bytes:>10}/{total_bytes:>10} \
+             ({binary_bytes_per_sec:>11}) {wide_msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    worker_pb.enable_steady_tick(Duration::from_millis(120));
+
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    for part in &package.parts {
+        let dest_path = target_dir.join(&part.filename);
+        match download_setup_part(
+            agent,
+            &part.url,
+            &dest_path,
+            part.size,
+            &worker_pb,
+            &total_pb,
+        ) {
+            Ok(true) => downloaded += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => {
+                failed += 1;
+                failures.push(format!("{}: {:#}", part.filename, e));
+            }
+        }
+    }
+
+    worker_pb.finish_and_clear();
+    total_pb.finish_and_clear();
+    _taskbar.finish();
+
+    println!();
+    println!(
+        "Done: {downloaded} part(s) downloaded, {skipped} already present, \
+         {failed} failed."
+    );
+    if !failures.is_empty() {
+        for f in &failures {
+            println!("  {f}");
+        }
+        bail!("{} part(s) failed to download", failures.len());
+    }
+    println!("Downloaded setup parts to: {}", target_dir.display());
+
+    // Decompression / extraction into the final game tree is not implemented yet.
+    match package.format {
+        "sting" => println!(
+            "note: decompressing the .peg parts into the game tree is not implemented yet."
+        ),
+        _ => println!(
+            "note: extracting the downloaded archives into the game tree is not implemented yet."
+        ),
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Download: shared fetch & manifest helpers
 // ---------------------------------------------------------------------------
 
-/// Fetch game info and manifest.  Returns `(GameInfo, NgmManifest, setup_base)`.
-fn fetch_game_and_manifest(
-    appid: &str,
-    allow_insecure: bool,
-    proxy: Option<&str>,
-) -> Result<(GameInfo, NgmManifest, String)> {
-    let agent = agent(allow_insecure, proxy);
-
+/// Fetch and parse the game-info response for `appid`.
+fn fetch_game_info(agent: &ureq::Agent, appid: &str) -> Result<GameInfo> {
     let info_url = format!("https://ngmapi.nexon.com/game-info/{appid}");
-    let info_json = http_get_string(&agent, &info_url)
+    let info_json = http_get_string(agent, &info_url)
         .with_context(|| format!("failed to fetch game info from {info_url}"))?;
-    let info: GameInfo =
-        serde_json::from_str(&info_json).context("failed to parse game-info response")?;
-
-    let manifest_name = info
-        .manifest_name
-        .as_deref()
-        .ok_or_else(|| anyhow!("no manifest available for {appid}"))?;
-
-    let setup_base = info.setup_file_url.trim_end_matches('/').to_owned();
-    let manifest_url = format!("{setup_base}/{manifest_name}");
-
-    let manifest_json = http_get_string(&agent, &manifest_url)
-        .with_context(|| format!("failed to fetch manifest from {manifest_url}"))?;
-    let manifest: NgmManifest =
-        serde_json::from_str(&manifest_json).context("failed to parse manifest JSON")?;
-
-    Ok((info, manifest, setup_base))
+    serde_json::from_str(&info_json).context("failed to parse game-info response")
 }
 
 // ---------------------------------------------------------------------------
@@ -915,10 +1523,27 @@ pub fn download_ngm(
     allow_insecure: bool,
     proxy: Option<&str>,
 ) -> Result<()> {
-    // ---- Step 1 & 2: fetch game info and manifest ----
-    let (info, manifest, setup_base) = fetch_game_and_manifest(appid, allow_insecure, proxy)?;
+    // ---- Step 1: fetch game info ----
+    let agent = agent(allow_insecure, proxy);
+    let info = fetch_game_info(&agent, appid)?;
+
+    // No `manifest_name`: the game is distributed as a setup package whose
+    // `.sting` / `.nfo` manifest sits at `setup_file_url`.  Download its parts.
+    if info.manifest_name.is_none() {
+        return download_ngm_setup(appid, target_dir, &info, &agent);
+    }
+
+    // ---- Step 2: download & parse the per-file patch manifest ----
+    let setup_base = info.setup_file_url.trim_end_matches('/').to_owned();
+    let manifest_name = info.manifest_name.as_deref().unwrap();
+    let manifest_url = format!("{setup_base}/{manifest_name}");
+    let manifest_json = http_get_string(&agent, &manifest_url)
+        .with_context(|| format!("failed to fetch manifest from {manifest_url}"))?;
+    let manifest: NgmManifest =
+        serde_json::from_str(&manifest_json).context("failed to parse manifest JSON")?;
+
     println!("Game:         {}", info.game_name);
-    println!("Manifest URL: {setup_base}/{}", info.manifest_name.as_deref().unwrap_or("?"));
+    println!("Manifest URL: {setup_base}/{manifest_name}");
     let total_files = manifest.files.len();
     let manifest_total: u64 = manifest.files.values().map(|f| f.uncompressed_size).sum();
     println!(
@@ -1041,8 +1666,6 @@ pub fn download_ngm(
     let failed_count = AtomicUsize::new(0);
     let bytes_downloaded = AtomicU64::new(0);
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    let agent = agent(allow_insecure, proxy);
 
     std::thread::scope(|scope| {
         let entries = &entries;
@@ -1833,5 +2456,141 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&out);
+    }
+
+    // ---- Setup package (.sting / .nfo) parsing ----
+
+    #[test]
+    fn sting_parses_real_sample() {
+        let json = r#"{
+    "version": 100,
+    "time_stamp": 1787132677,
+    "original_size": 64685940445,
+    "compressed_size": 61581778412,
+    "sting_name": "maplestory",
+    "compressed_file_count": 16
+}"#;
+        let sting: StingInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(sting.version, Some(100));
+        assert_eq!(sting.time_stamp, Some(1787132677));
+        assert_eq!(sting.original_size, Some(64_685_940_445));
+        assert_eq!(sting.compressed_size, Some(61_581_778_412));
+        assert_eq!(sting.sting_name, "maplestory");
+        assert_eq!(sting.compressed_file_count, 16);
+
+        let files: Vec<String> = sting.part_files();
+        assert_eq!(files.len(), 16);
+        assert_eq!(files[0], "maplestory.peg00");
+        assert_eq!(files[15], "maplestory.peg15");
+    }
+
+    #[test]
+    fn nfo_parses_real_sample() {
+        let nfo = "NFO300,9526927360; DO NOT edit this line manually\r\n\
+                   \"Mabinogi.z00\",\"819766191\",\"3145492277\"\r\n\
+                   \"Mabinogi.z01\",\"-1532145412\",\"3142701016\"\r\n\
+                   \"Mabinogi.z02\",\"1976795850\",\"2788447889\"\r\n";
+        let parts = parse_nfo(nfo).unwrap();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].name, "Mabinogi.z00");
+        assert_eq!(parts[0].size, 3145492277);
+        assert_eq!(parts[1].name, "Mabinogi.z01");
+        assert_eq!(parts[1].size, 3142701016);
+        assert_eq!(parts[2].name, "Mabinogi.z02");
+        assert_eq!(parts[2].size, 2788447889);
+
+        // The NFO's per-archive third field is the byte size (verified against
+        // the live Content-Length of the .zNN files), so the total is the sum.
+        let total: u64 = parts.iter().map(|p| p.size).sum();
+        assert_eq!(total, 3145492277 + 3142701016 + 2788447889);
+    }
+
+    #[test]
+    fn url_helpers_split_extension_and_dir() {
+        assert_eq!(
+            url_extension("http://maplestory.dn.nexoncdn.co.kr/589825.sting").as_deref(),
+            Some("sting")
+        );
+        assert_eq!(
+            url_extension("http://webdown2.nexon.co.jp/mabinogi/inst/Mabinogi.nfo").as_deref(),
+            Some("nfo")
+        );
+        assert_eq!(
+            url_extension("http://example.com/archive.ZIP").as_deref(),
+            Some("zip")
+        );
+        assert_eq!(url_extension("http://example.com/noext"), None);
+        assert_eq!(
+            url_base_dir("http://maplestory.dn.nexoncdn.co.kr/589825.sting"),
+            "http://maplestory.dn.nexoncdn.co.kr"
+        );
+        assert_eq!(
+            url_base_dir("http://webdown2.nexon.co.jp/mabinogi/inst/Mabinogi.nfo"),
+            "http://webdown2.nexon.co.jp/mabinogi/inst"
+        );
+    }
+
+    #[test]
+    fn setup_total_size_falls_back_to_sting_compressed_size() {
+        let sting = StingInfo {
+            version: Some(100),
+            time_stamp: None,
+            original_size: Some(1000),
+            compressed_size: Some(800),
+            sting_name: "game".to_owned(),
+            compressed_file_count: 2,
+        };
+        let package = SetupPackage {
+            format: "sting",
+            url: "http://x/game.sting".to_owned(),
+            parts: vec![
+                SetupPart {
+                    filename: "game.peg00".into(),
+                    url: "http://x/game.peg00".into(),
+                    size: None,
+                },
+                SetupPart {
+                    filename: "game.peg01".into(),
+                    url: "http://x/game.peg01".into(),
+                    size: None,
+                },
+            ],
+            release_date_raw: None,
+            release_date: None,
+            sting: Some(sting),
+        };
+        assert_eq!(setup_total_size(&package), 800);
+    }
+
+    #[test]
+    fn setup_total_size_sums_known_part_sizes() {
+        let package = SetupPackage {
+            format: "nfo",
+            url: "http://x/Mabinogi.nfo".to_owned(),
+            parts: vec![
+                SetupPart {
+                    filename: "Mabinogi.z00".into(),
+                    url: "http://x/Mabinogi.z00".into(),
+                    size: Some(10),
+                },
+                SetupPart {
+                    filename: "Mabinogi.z01".into(),
+                    url: "http://x/Mabinogi.z01".into(),
+                    size: Some(20),
+                },
+            ],
+            release_date_raw: None,
+            release_date: None,
+            sting: None,
+        };
+        assert_eq!(setup_total_size(&package), 30);
+    }
+
+    #[test]
+    fn unknown_manifest_type_is_rejected() {
+        let agent = agent(false, None);
+        let err = fetch_setup_package(&agent, "http://example.com/install.exe").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Unknown manifest type : exe"), "got: {msg}");
     }
 }
