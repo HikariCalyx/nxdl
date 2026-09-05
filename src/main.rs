@@ -6,6 +6,7 @@ mod net;
 mod ngm;
 mod nxl;
 mod nxl_patch;
+mod peg;
 mod relpath;
 mod resume;
 mod taskprogress;
@@ -271,6 +272,17 @@ fn main() -> Result<()> {
                          or --patch <TARGET_PATH>)"
                     );
                 }
+                return Ok(());
+            }
+            Commands::Peg {
+                extract,
+                outdir,
+                verbose,
+            } => {
+                let outdir = outdir
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                peg::manual_extract(extract, &outdir, *verbose > 0)?;
                 return Ok(());
             }
         }

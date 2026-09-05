@@ -267,6 +267,32 @@ pub enum Commands {
         #[arg(long)]
         allow_insecure: bool,
     },
+
+    /// PEG package operations.
+    ///
+    /// Nexon `.sting` full-client setups are split into numbered `.pegNN`
+    /// parts.  This extracts such parts you have already downloaded (e.g.
+    /// with a browser or download manager) into a local directory.  Each
+    /// file's decompressed size and CRC-32 are verified against the part, and
+    /// a target file whose CRC-32 already matches is skipped, so interrupted
+    /// runs resume automatically.
+    Peg {
+        /// The `.pegNN` file to extract, or a directory containing `*.peg*`
+        /// files.  When a directory is given, only its top level is scanned
+        /// (not sub-directories) and every matching part is extracted into
+        /// `--outdir`.
+        #[arg(long, value_name = "PEG_FILE_OR_DIR")]
+        extract: PathBuf,
+
+        /// Directory to write the extracted files into (created if needed).
+        /// Defaults to the current directory.
+        #[arg(long, value_name = "DIR")]
+        outdir: Option<PathBuf>,
+
+        /// Print each directory / file as it is extracted.
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
+    },
 }
 
 impl Cli {

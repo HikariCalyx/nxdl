@@ -29,7 +29,7 @@
 //!    the original file and the patch file is deleted.
 
 use std::collections::HashMap;
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -592,8 +592,9 @@ pub fn check_ngm(
 //   `<sting_name>.pegNN`.
 // - `.nfo`   — a legacy NFO file listing `<name>.zNN` split archives.
 //
-// The parts are downloaded as-is into the target directory; decompressing /
-// extracting them into the final game tree is not implemented yet.
+// The parts are downloaded as-is into the target directory.  `.sting` parts
+// (PEG packages, see [`crate::peg`]) are then decompressed into the final
+// game tree; decompressing the `.nfo` split archives is not implemented yet.
 
 /// JSON output for `--check --json` on a setup-package (no-manifest) game.
 #[derive(serde::Serialize)]
@@ -610,6 +611,10 @@ struct SetupCheckResult {
     archive_count: usize,
     /// Total number of bytes that will be downloaded.
     total_size: u64,
+    /// Byte size of every part, in part order (sting parts are HEADed so the
+    /// exact sizes are known).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    part_sizes: Vec<u64>,
     /// Installed (uncompressed) size, when the sting declares it.
     #[serde(skip_serializing_if = "Option::is_none")]
     original_size: Option<u64>,
@@ -822,6 +827,25 @@ fn setup_total_size(package: &SetupPackage) -> u64 {
         .unwrap_or_else(|| package.parts.iter().filter_map(|p| p.size).sum())
 }
 
+/// Best-effort: HEAD any part whose size is unknown (sting parts carry no
+/// sizes in the manifest) so totals / JSON can show real byte sizes.  Returns
+/// the number of parts whose size is still unknown.
+fn resolve_part_sizes(agent: &ureq::Agent, parts: &mut [SetupPart]) -> usize {
+    let mut unknown = 0usize;
+    for part in parts.iter_mut().filter(|p| p.size.is_none()) {
+        match agent.head(&part.url).call() {
+            Ok(resp) => {
+                part.size = resp.header("Content-Length").and_then(|s| s.parse().ok());
+                if part.size.is_none() {
+                    unknown += 1;
+                }
+            }
+            Err(_) => unknown += 1,
+        }
+    }
+    unknown
+}
+
 /// Check a setup-package game (no `manifest_name`): fetch the `.sting`/`.nfo`
 /// manifest from `setup_file_url` and print a summary of the parts.
 fn check_ngm_setup(
@@ -831,11 +855,19 @@ fn check_ngm_setup(
     json: bool,
     agent: &ureq::Agent,
 ) -> Result<()> {
-    let package = fetch_setup_package(agent, &info.setup_file_url)?;
+    let mut package = fetch_setup_package(agent, &info.setup_file_url)?;
+
+    // `--check --json` reports the exact byte size of every part; sting parts
+    // (which the manifest leaves un-sized) are learned via HEAD requests.
+    if json {
+        resolve_part_sizes(agent, &mut package.parts);
+    }
+
     let archive_count = package.parts.len();
     let total_size = setup_total_size(&package);
 
     if json {
+        let part_sizes: Vec<u64> = package.parts.iter().map(|p| p.size.unwrap_or(0)).collect();
         let result = SetupCheckResult {
             appid: appid.to_owned(),
             game_name: info.game_name.clone(),
@@ -844,6 +876,7 @@ fn check_ngm_setup(
             release_date: package.release_date,
             archive_count,
             total_size,
+            part_sizes,
             original_size: package.sting.as_ref().and_then(|s| s.original_size),
             sting_name: package.sting.as_ref().map(|s| s.sting_name.clone()),
         };
@@ -853,15 +886,18 @@ fn check_ngm_setup(
         println!("  game:           {}", info.game_name);
         println!("  product:        {appid}");
         println!("  setup type:     {} ({})", package.format, package.url);
-        if let Some(ref raw) = package.release_date_raw {
-            println!("  release date:   {raw}");
+        // Human-readable release date (Unix seconds are kept only in JSON).
+        match package.release_date {
+            Some(ts) => println!("  release date:   {} (UTC)", format_unix_utc(ts)),
+            None => {
+                if let Some(ref raw) = package.release_date_raw {
+                    println!("  release date:   {raw}");
+                }
+            }
         }
         if let Some(ref sting) = package.sting {
             if let Some(v) = sting.version {
                 println!("  version:        {v}");
-            }
-            if let Some(ts) = sting.time_stamp {
-                println!("  time stamp:     {ts}");
             }
             if let Some(os) = sting.original_size {
                 println!(
@@ -879,15 +915,21 @@ fn check_ngm_setup(
         );
 
         if verbose && archive_count > 0 {
-            println!();
-            println!("{:<40} {:>16}", "PART", "SIZE");
-            println!("{:-<40} {:-<16}", "", "");
-            for part in &package.parts {
-                let size = match part.size {
-                    Some(s) => human_size(s),
-                    None => "?".to_owned(),
-                };
-                println!("{:<40} {:>16}", part.filename, size);
+            if package.format == "sting" {
+                // Read each `.pegNN` part's index over HTTP and list the
+                // files it will extract.
+                list_peg_contents(agent, &package)?;
+            } else {
+                println!();
+                println!("{:<40} {:>16}", "PART", "SIZE");
+                println!("{:-<40} {:-<16}", "", "");
+                for part in &package.parts {
+                    let size = match part.size {
+                        Some(s) => human_size(s),
+                        None => "?".to_owned(),
+                    };
+                    println!("{:<40} {:>16}", part.filename, size);
+                }
             }
         }
     }
@@ -900,6 +942,431 @@ fn part_path(dest: &Path) -> std::path::PathBuf {
     let mut s = dest.as_os_str().to_owned();
     s.push(".part");
     std::path::PathBuf::from(s)
+}
+
+// ---------------------------------------------------------------------------
+// Setup packages: listing a `.pegNN` part's contents over HTTP
+// ---------------------------------------------------------------------------
+
+/// Byte window fetched per HTTP range request while walking a PEG index.
+///
+/// A file entry's header (magic + sizes + hash + name) is only a few hundred
+/// bytes and its payload is skipped with a seek, so a small window keeps the
+/// bytes pulled from the server to roughly `entries × window` at most.
+/// Payload bytes are never downloaded.
+const PEG_RANGE_WINDOW: u64 = 16 * 1024;
+
+/// A read-only view of a remote file, backed by HTTP `Range` requests.
+///
+/// Only a window around the cursor is buffered, so skipping forward over PEG
+/// payloads costs no data transfer.  Implements [`std::io::Read`] +
+/// [`std::io::Seek`] so the PEG structure walker in [`crate::peg`] can run
+/// against it directly.
+struct HttpRangeReader {
+    agent: ureq::Agent,
+    url: String,
+    length: u64,
+    pos: u64,
+    buf: Vec<u8>,
+    buf_start: u64,
+    /// Total bytes actually read from the server (for reporting).
+    fetched: u64,
+}
+
+impl HttpRangeReader {
+    fn new(agent: &ureq::Agent, url: &str) -> Self {
+        HttpRangeReader {
+            agent: agent.clone(),
+            url: url.to_owned(),
+            length: 0,
+            pos: 0,
+            buf: Vec::new(),
+            buf_start: 0,
+            fetched: 0,
+        }
+    }
+
+    /// Total number of bytes read from the server so far.
+    fn bytes_fetched(&self) -> u64 {
+        self.fetched
+    }
+
+    /// Fetch the window covering `self.pos`.
+    fn fill(&mut self) -> std::io::Result<()> {
+        if self.length != 0 && self.pos >= self.length {
+            self.buf.clear();
+            return Ok(()); // at EOF
+        }
+        let end = self.pos + PEG_RANGE_WINDOW;
+        let range = format!("bytes={}-{}", self.pos, end - 1);
+        let resp = match self.agent.get(&self.url).set("Range", &range).call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(416, _)) => {
+                // Range not satisfiable → past the end of the file (EOF).
+                self.buf.clear();
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(std::io::Error::other(format!(
+                    "HTTP range request failed: {e}"
+                )))
+            }
+        };
+        let status = resp.status();
+        match status {
+            206 => {
+                // Content-Range: "bytes start-end/total" — learn the length.
+                if let Some(total) = resp
+                    .header("Content-Range")
+                    .and_then(|cr| cr.rsplit('/').next())
+                    .and_then(|t| t.trim().parse::<u64>().ok())
+                {
+                    self.length = total;
+                }
+            }
+            200 if self.pos == 0 => {
+                // Server ignored the Range header, but we are at offset 0 so
+                // the body is fine; only ever read up to a window of it.
+                self.length = resp
+                    .header("Content-Length")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(self.length);
+            }
+            200 => {
+                return Err(std::io::Error::other(
+                    "server ignored the Range request; cannot stream a PEG index",
+                ))
+            }
+            other => {
+                return Err(std::io::Error::other(format!(
+                    "unexpected HTTP status {other} fetching {}",
+                    self.url
+                )))
+            }
+        }
+
+        self.buf.clear();
+        self.buf_start = self.pos;
+        resp.into_reader()
+            .take(PEG_RANGE_WINDOW)
+            .read_to_end(&mut self.buf)?;
+        self.fetched += self.buf.len() as u64;
+        Ok(())
+    }
+}
+
+impl Read for HttpRangeReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.length != 0 && self.pos >= self.length {
+            return Ok(0); // EOF
+        }
+        // (Re)fill the window when the cursor has moved outside of it.
+        if self.buf.is_empty()
+            || self.pos < self.buf_start
+            || self.pos >= self.buf_start + self.buf.len() as u64
+        {
+            self.fill()?;
+        }
+        if self.buf.is_empty() {
+            return Ok(0);
+        }
+        let off = (self.pos - self.buf_start) as usize;
+        if off >= self.buf.len() {
+            return Ok(0);
+        }
+        let n = out.len().min(self.buf.len() - off);
+        out[..n].copy_from_slice(&self.buf[off..off + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for HttpRangeReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let new_pos = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::End(delta) => {
+                if self.length == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "seek from end with unknown length",
+                    ));
+                }
+                (self.length as i64 + delta).max(0) as u64
+            }
+            SeekFrom::Current(delta) => (self.pos as i64 + delta).max(0) as u64,
+        };
+        // Drop the window only when the new position lies outside it; small
+        // in-window skips (e.g. over tiny payloads) keep it cached.
+        if self.buf.is_empty()
+            || new_pos < self.buf_start
+            || new_pos > self.buf_start + self.buf.len() as u64
+        {
+            self.buf.clear();
+        }
+        self.pos = new_pos;
+        Ok(new_pos)
+    }
+}
+
+/// FILETIME (100 ns since 1601-01-01) → Unix seconds.
+fn filetime_to_unix(filetime: u64) -> Option<i64> {
+    const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000; // 1601→1970, 100 ns units
+    if filetime == 0 || filetime < FILETIME_UNIX_EPOCH {
+        return None;
+    }
+    Some(((filetime - FILETIME_UNIX_EPOCH) / 10_000_000) as i64)
+}
+
+/// Days since epoch → `(year, month, day)` (proleptic Gregorian).  Inverse of
+/// [`days_from_civil`], from Howard Hinnant's algorithms.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Format a Unix timestamp as `YYYY-MM-DD HH:MM:SS` (UTC).
+fn format_unix_utc(ts: i64) -> String {
+    let days = ts.div_euclid(86_400);
+    let secs = ts.rem_euclid(86_400);
+    let (y, mo, d) = civil_from_days(days);
+    let (h, mi, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+/// Format a PEG FILETIME for display (or "N/A" when unset).
+fn format_filetime(filetime: u64) -> String {
+    match filetime_to_unix(filetime) {
+        Some(ts) => format_unix_utc(ts),
+        None => "N/A".to_owned(),
+    }
+}
+
+/// Truncate `s` to at most `n` characters (appending `..`) for table output.
+fn clip_to(s: &str, n: usize) -> String {
+    let len = s.chars().count();
+    if len <= n {
+        return s.to_owned();
+    }
+    let keep = n.saturating_sub(2);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push_str("..");
+    out
+}
+
+/// One item streamed out of a part walker, in parse order.
+enum PegListEvent {
+    Header(crate::peg::PegHeaderInfo),
+    File(crate::peg::PegFileInfo),
+    Done { dirs: u64, fetched: u64 },
+    Error(String),
+}
+
+/// Print the file-table column header (once, before streaming starts).
+fn print_file_header() {
+    println!();
+    println!(
+        "    {:<52} {:>14} {:>14} {:>8}  {}",
+        "PATH", "UNCOMP", "COMP", "CRC32", "MODIFIED (UTC)"
+    );
+    println!(
+        "    {:-<52} {:-<14} {:-<14} {:-<8}  {:-<19}",
+        "", "", "", "", ""
+    );
+}
+
+/// Print one streamed file row.
+fn print_file_row(f: &crate::peg::PegFileInfo) {
+    println!(
+        "    {:<52} {:>14} {:>14} {:>08x}  {}",
+        clip_to(&f.name, 52),
+        format_bytes(f.uncompressed_size),
+        format_bytes(f.compressed_size),
+        f.crc32,
+        format_filetime(f.filetime),
+    );
+}
+
+/// Fetch and print the file index of every `.pegNN` part in a sting package.
+///
+/// Each part is parsed on its own thread and its entries are streamed to this
+/// thread over a per-part channel, so a file line is printed as soon as its
+/// entry is found.  Later parts are parsed concurrently in the background and
+/// their (buffered) entries print when their turn comes, keeping the output in
+/// part order.
+fn list_peg_contents(agent: &ureq::Agent, package: &SetupPackage) -> Result<()> {
+    use std::sync::mpsc;
+
+    let parts = &package.parts;
+    let count = parts.len();
+    println!();
+    println!(
+        "Reading the file index of {count} .peg part(s) from the CDN \
+         (~1 request per file entry); streaming files as they are found ..."
+    );
+
+    // One unbounded channel per part: the worker for part `i` pushes entries
+    // as it parses them; the printer below consumes them in part order.
+    let mut senders = Vec::with_capacity(count);
+    let mut receivers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (tx, rx) = mpsc::channel::<PegListEvent>();
+        senders.push(tx);
+        receivers.push(rx);
+    }
+
+    let mut total_files = 0u64;
+    let mut total_dirs = 0u64;
+    let mut total_uncompressed = 0u64;
+    let mut total_fetched = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+
+    std::thread::scope(|scope| {
+        for (idx, part) in parts.iter().enumerate() {
+            let tx = senders[idx].clone();
+            let url = part.url.clone();
+            scope.spawn(move || {
+                let result = (|| -> Result<()> {
+                    let mut r = HttpRangeReader::new(agent, &url);
+                    let dirs = crate::peg::walk_entries(
+                        &mut r,
+                        &mut |h| {
+                            let _ = tx.send(PegListEvent::Header(h.clone()));
+                        },
+                        &mut |f| {
+                            let _ = tx.send(PegListEvent::File(f.clone()));
+                        },
+                    )
+                    .with_context(|| format!("failed to list {url}"))?;
+                    let _ = tx.send(PegListEvent::Done {
+                        dirs,
+                        fetched: r.bytes_fetched(),
+                    });
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    let _ = tx.send(PegListEvent::Error(format!("{e:#}")));
+                }
+            });
+        }
+        drop(senders); // only the worker clones remain; they close on completion
+
+        print_file_header();
+
+        for cur in 0..count {
+            let part = &parts[cur];
+            let mut files = 0u64;
+            let mut uncompressed = 0u64;
+            let mut dirs = 0u64;
+            let mut fetched = 0u64;
+            let mut failed: Option<String> = None;
+
+            // Drain this part's channel, printing each file as it arrives.
+            loop {
+                match receivers[cur].recv() {
+                    Ok(PegListEvent::Header(h)) => {
+                        let size_str = if h.declared_file_size > 0 {
+                            format_bytes(h.declared_file_size)
+                        } else {
+                            "?".to_owned()
+                        };
+                        let declared_str = if h.declared_uncompressed > 0 {
+                            human_size(h.declared_uncompressed)
+                        } else {
+                            "?".to_owned()
+                        };
+                        println!();
+                        println!(
+                            "  [peg {}/{count}] {}  (part {}/{}, part size {}, \
+                             declared {declared_str} uncompressed)",
+                            cur + 1,
+                            part.filename,
+                            h.peg_number,
+                            h.total_pegs,
+                            size_str,
+                        );
+                    }
+                    Ok(PegListEvent::File(f)) => {
+                        files += 1;
+                        uncompressed += f.uncompressed_size;
+                        print_file_row(&f);
+                    }
+                    Ok(PegListEvent::Done {
+                        dirs: d,
+                        fetched: ft,
+                    }) => {
+                        dirs = d;
+                        fetched = ft;
+                        break;
+                    }
+                    Ok(PegListEvent::Error(msg)) => {
+                        failed = Some(msg);
+                        break;
+                    }
+                    Err(_) => break, // channel closed without a Done event
+                }
+            }
+
+            match failed {
+                Some(msg) => {
+                    failures.push(format!("{}: {msg}", part.filename));
+                    println!(
+                        "  [peg {}/{count}] {}: FAILED - {msg}",
+                        cur + 1,
+                        part.filename
+                    );
+                }
+                None => {
+                    total_files += files;
+                    total_dirs += dirs;
+                    total_uncompressed += uncompressed;
+                    total_fetched += fetched;
+                    println!(
+                        "  [done] {}: {files} file(s), {dirs} dir(s), {} decompressed \
+                         (read {} for the index)",
+                        part.filename,
+                        human_size(uncompressed),
+                        format_bytes(fetched),
+                    );
+                }
+            }
+        }
+    });
+
+    if !failures.is_empty() {
+        println!();
+        println!("Failed to read some .peg parts:");
+        for f in &failures {
+            println!("  {f}");
+        }
+    }
+    println!();
+    println!(
+        "  Totals: {total_files} file(s), {total_dirs} dir(s), {} decompressed \
+         across {count} part(s)",
+        human_size(total_uncompressed),
+    );
+    println!(
+        "  Bytes read from the CDN for the indexes: {} (the .peg payloads were \
+         skipped, not downloaded).",
+        format_bytes(total_fetched),
+    );
+    if !failures.is_empty() {
+        bail!("{} .peg part(s) could not be read", failures.len());
+    }
+    Ok(())
 }
 
 /// Download one whole setup part into `dest_path`, resuming from the bytes
@@ -1072,11 +1539,10 @@ fn download_setup_part(
 }
 
 /// Download a setup-package client (no `manifest_name`): fetch the
-/// `.sting`/`.nfo` manifest from `setup_file_url` and download every numbered
-/// part into `target_dir`.
-///
-/// Decompressing / extracting the parts into the final game tree is not
-/// implemented yet.
+/// `.sting`/`.nfo` manifest from `setup_file_url` and install the client into
+/// `target_dir`.  `.sting` PEG packages are stream-downloaded and extracted in
+/// one pass (no `.pegNN` part file kept on disk); `.nfo` split archives are
+/// downloaded first (their extraction is not implemented yet).
 fn download_ngm_setup(
     appid: &str,
     target_dir: &Path,
@@ -1087,13 +1553,7 @@ fn download_ngm_setup(
 
     // The `.sting` format does not list per-part sizes, so ask each server for
     // its `Content-Length` (best-effort) to show accurate progress.
-    for part in package.parts.iter_mut().filter(|p| p.size.is_none()) {
-        if let Ok(resp) = agent.head(&part.url).call() {
-            part.size = resp
-                .header("Content-Length")
-                .and_then(|s| s.parse::<u64>().ok());
-        }
-    }
+    resolve_part_sizes(agent, &mut package.parts);
 
     let archive_count = package.parts.len();
     let total_size = setup_total_size(&package);
@@ -1132,6 +1592,14 @@ fn download_ngm_setup(
         )
     })?;
 
+    // `.sting` packages install straight from the CDN stream: each `.pegNN`
+    // part is downloaded and extracted in one pass, verifying CRC-32 as it
+    // goes, so the part is never stored on disk.
+    if package.format == "sting" {
+        return stream_extract_sting(agent, target_dir, &package);
+    }
+
+    // `.nfo` packages are downloaded as `.zNN` split archives first.
     // ---- Progress bars ----
     let mp = MultiProgress::new();
     // Hide bars when stdout is not a terminal (piped / redirected).
@@ -1202,18 +1670,262 @@ fn download_ngm_setup(
         }
         bail!("{} part(s) failed to download", failures.len());
     }
-    println!("Downloaded setup parts to: {}", target_dir.display());
+    println!("Downloaded setup archives to: {}", target_dir.display());
+    println!(
+        "note: extracting the downloaded `.nfo` archives into the game tree \
+         is not implemented yet."
+    );
 
-    // Decompression / extraction into the final game tree is not implemented yet.
-    match package.format {
-        "sting" => println!(
-            "note: decompressing the .peg parts into the game tree is not implemented yet."
-        ),
-        _ => println!(
-            "note: extracting the downloaded archives into the game tree is not implemented yet."
-        ),
+    Ok(())
+}
+
+/// A `Read` wrapper that feeds the downloaded-byte count into the progress
+/// bars while a `.pegNN` part is streamed off the CDN.
+struct DownloadProgressRead<'a, R: Read> {
+    inner: R,
+    worker: &'a ProgressBar,
+    total: &'a ProgressBar,
+}
+
+impl<R: Read> Read for DownloadProgressRead<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.worker.inc(n as u64);
+            self.total.inc(n as u64);
+        }
+        Ok(n)
+    }
+}
+
+/// Path of the tiny resume marker that records how far a `.pegNN` part has
+/// been installed (byte offset of the next entry).  Only this offset is ever
+/// kept — never the part itself.
+fn peg_checkpoint_path(output_dir: &Path, part: &SetupPart) -> std::path::PathBuf {
+    output_dir.join(format!(".{}.nxdlckpt", part.filename))
+}
+
+fn write_checkpoint(path: &Path, offset: u64) {
+    if let Err(e) = std::fs::write(path, offset.to_string()) {
+        eprintln!("warning: failed to write resume marker {}: {e}", path.display());
+    }
+}
+
+fn read_checkpoint(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn clear_checkpoint(path: &Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// Stream-download and install a single `.pegNN` part, resuming where a
+/// previous attempt left off.
+///
+/// The part body is streamed from the CDN into
+/// [`crate::peg::extract_peg_install`], which decompresses each file into
+/// `output_dir` (verifying size + CRC-32) and skips any file whose target
+/// already exists with the expected CRC-32.  A tiny `.nxdlckpt` marker records
+/// the byte offset of the *next* entry after every handled file, so if the
+/// stream breaks the part is re-fetched with an HTTP `Range` request starting
+/// at that offset — already-installed files are not re-downloaded.  The
+/// `.pegNN` part itself is never stored.
+fn stream_extract_part(
+    agent: &ureq::Agent,
+    part: &SetupPart,
+    output_dir: &Path,
+    worker: &ProgressBar,
+    total: &ProgressBar,
+) -> Result<crate::peg::PegStats> {
+    const ATTEMPTS: usize = 8;
+    let mut last_err: Option<anyhow::Error> = None;
+    let checkpoint = peg_checkpoint_path(output_dir, part);
+
+    for attempt in 1..=ATTEMPTS {
+        // Where to resume: the offset right after the last fully-installed
+        // entry (from a previous run or a failed attempt in this run).
+        let start_at = read_checkpoint(&checkpoint).unwrap_or(0);
+        if let Some(size) = part.size {
+            if size > 0 && start_at >= size {
+                // This part was fully installed earlier; nothing left to do.
+                clear_checkpoint(&checkpoint);
+                return Ok(crate::peg::PegStats::default());
+            }
+        }
+
+        worker.set_position(start_at.min(part.size.unwrap_or(0)));
+        worker.set_message(if attempt > 1 {
+            format!("{} (attempt {attempt}, resuming at byte {start_at})", part.filename)
+        } else if start_at > 0 {
+            format!("{} (resuming at byte {start_at})", part.filename)
+        } else {
+            part.filename.clone()
+        });
+
+        let mut req = agent.get(&part.url);
+        if start_at > 0 {
+            req = req.set("Range", &format!("bytes={start_at}-"));
+        }
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow!("HTTP request failed: {e}"));
+                continue;
+            }
+        };
+
+        let status = resp.status();
+        if start_at > 0 && status == 200 {
+            // The server ignored our Range request — fall back to downloading
+            // the whole part again from the beginning.
+            clear_checkpoint(&checkpoint);
+            continue;
+        }
+        if status != 200 && status != 206 {
+            last_err = Some(anyhow!("unexpected HTTP status {status}"));
+            continue;
+        }
+
+        let body = DownloadProgressRead {
+            inner: resp.into_reader(),
+            worker,
+            total,
+        };
+        let mut buffered = std::io::BufReader::new(body);
+
+        let result = crate::peg::extract_peg_install(
+            &mut buffered,
+            output_dir,
+            start_at,
+            |next| write_checkpoint(&checkpoint, next),
+        );
+
+        match result {
+            Ok(stats) => {
+                clear_checkpoint(&checkpoint);
+                return Ok(stats);
+            }
+            Err(e) => {
+                // The marker now points at the first entry that was not fully
+                // installed; the next attempt (or a later run) resumes there.
+                last_err = Some(e);
+            }
+        }
     }
 
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to install {}", part.filename)))
+}
+
+/// Stream-install a `.sting` client: every `.pegNN` part is downloaded and
+/// extracted straight into `target_dir` in one pass, verifying each file's
+/// CRC-32.  No `.pegNN` file is stored on disk.
+fn stream_extract_sting(
+    agent: &ureq::Agent,
+    target_dir: &Path,
+    package: &SetupPackage,
+) -> Result<()> {
+    let parts = &package.parts;
+    let count = parts.len();
+    let total_size = setup_total_size(package);
+    println!();
+    println!(
+        "Stream-installing {count} .peg part(s) into {} (no part files stored) ...",
+        target_dir.display()
+    );
+
+    let mp = MultiProgress::new();
+    // Hide bars when stdout is not a terminal (piped / redirected).
+    if !std::io::stdout().is_terminal() {
+        mp.set_draw_target(ProgressDrawTarget::hidden());
+    }
+    let total_pb = mp.add(ProgressBar::new(total_size));
+    total_pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+             {bytes}/{total_bytes} ({binary_bytes_per_sec}, ETA {eta})",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    total_pb.enable_steady_tick(Duration::from_millis(120));
+
+    // Reflect overall progress on the OS taskbar / dock (cleared on drop).
+    let mut _taskbar = crate::taskprogress::watch(total_pb.clone(), total_size);
+
+    let worker_pb = mp.add(ProgressBar::new(0));
+    worker_pb.set_style(
+        ProgressStyle::with_template(
+            "  [{bar:25.green/white}] {bytes:>10}/{total_bytes:>10} \
+             ({binary_bytes_per_sec:>11}) {wide_msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    worker_pb.enable_steady_tick(Duration::from_millis(120));
+
+    let mut total_files = 0u64;
+    let mut total_skipped = 0u64;
+    let mut total_bytes = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+
+    for (idx, part) in parts.iter().enumerate() {
+        let part_size = part.size.unwrap_or(0);
+        worker_pb.set_length(part_size);
+        worker_pb.set_message(part.filename.clone());
+        worker_pb.set_position(0);
+
+        match stream_extract_part(agent, part, target_dir, &worker_pb, &total_pb) {
+            Ok(stats) => {
+                total_files += stats.files;
+                total_skipped += stats.skipped_files;
+                total_bytes += stats.uncompressed_bytes;
+                let skipped = if stats.skipped_files > 0 {
+                    format!(", {} skipped (CRC ok)", stats.skipped_files)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  [peg {}/{count}] {}: {} file(s){}, {} dir(s), {} decompressed",
+                    idx + 1,
+                    part.filename,
+                    stats.files,
+                    skipped,
+                    stats.dirs,
+                    human_size(stats.uncompressed_bytes),
+                );
+            }
+            Err(e) => failures.push(format!("{}: {:#}", part.filename, e)),
+        }
+    }
+
+    worker_pb.finish_and_clear();
+    total_pb.finish_and_clear();
+    _taskbar.finish();
+
+    println!();
+    if !failures.is_empty() {
+        println!("Failed parts:");
+        for f in &failures {
+            println!("  {f}");
+        }
+        println!(
+            "Note: installed files were kept; re-run to finish. Each failed part \
+             resumes from where it stopped (Range request), so already-installed \
+             files are not re-downloaded."
+        );
+        bail!("{} part(s) failed to install", failures.len());
+    }
+    let skipped_note = if total_skipped > 0 {
+        format!(", {} skipped (already present)", total_skipped)
+    } else {
+        String::new()
+    };
+    println!(
+        "Installed {total_files} file(s){skipped_note} ({total_bytes} bytes \
+         decompressed) into {}",
+        target_dir.display()
+    );
+    println!("All file CRC-32 checks passed; no .peg part files were stored.");
     Ok(())
 }
 
@@ -2410,6 +3122,47 @@ pub fn patch_ngm(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live smoke test of the HTTP range reader against one real KMS `.peg`
+    /// part (structure only, no payload transfer).  Opt-in because it needs
+    /// the network and issues roughly one request per file entry.
+    #[test]
+    fn lists_kms_peg00_over_http() {
+        if std::env::var("NXDL_LIVE_PEG").as_deref() != Ok("1") {
+            return;
+        }
+        let agent = agent(false, None);
+        let url = "http://maplestory.dn.nexoncdn.co.kr/maplestory.peg00";
+        let mut r = HttpRangeReader::new(&agent, url);
+        let index = crate::peg::list_package(&mut r).unwrap();
+        let fetched = r.bytes_fetched();
+
+        let h = index.header.as_ref().expect("header present");
+        assert_eq!(h.peg_number, 0);
+        assert_eq!(h.total_pegs, 16);
+        assert!(
+            index.files.len() > 100,
+            "expected many files, got {}",
+            index.files.len()
+        );
+        assert!(index.total_uncompressed() > 0);
+        assert!(index.files.iter().any(|f| f.name.contains("BlackCipher")));
+
+        // The whole point of listing is to NOT download the payloads: bytes
+        // fetched must be tiny compared with the part itself.
+        eprintln!(
+            "peg00: {} file entries, part size ~{} bytes, fetched {} bytes for the index",
+            index.files.len(),
+            h.declared_file_size,
+            fetched,
+        );
+        assert!(fetched > 0, "expected some index bytes to be fetched");
+        assert!(
+            fetched < h.declared_file_size / 100,
+            "fetched too much: {fetched} bytes vs part size {}",
+            h.declared_file_size
+        );
+    }
 
     #[test]
     fn apply_reference_patch() {
