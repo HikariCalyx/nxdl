@@ -1,6 +1,6 @@
 [package]
 name = "nxdl"
-version = "0.1.2-prerelease7"
+version = "0.1.2-prerelease8"
 edition = "2021"
 description = "A downloader for NX games"
 license = "MIT"

@@ -193,6 +193,7 @@ fn main() -> Result<()> {
                 filter_regex,
                 invert_filter,
                 json,
+                streamed,
                 proxy,
                 allow_insecure,
             } => {
@@ -239,6 +240,7 @@ fn main() -> Result<()> {
                         filter.as_ref(),
                         allow_insecure,
                         proxy,
+                        *streamed,
                     )?;
                 } else if let Some(ref pa) = patch {
                     let (manifest_source, target_path) = match pa.as_slice() {
@@ -425,6 +427,7 @@ fn main() -> Result<()> {
                                 filter.as_ref(),
                                 allow_insecure,
                                 proxy,
+                                cli.streamed,
                             )?;
                         } else {
                             // NXL download: <TARGET_PATH>, manifest resolved

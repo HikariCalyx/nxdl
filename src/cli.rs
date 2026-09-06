@@ -109,6 +109,13 @@ pub struct Cli {
     /// overwritten in-place as usual.
     #[arg(long)]
     pub keep_old_wz: bool,
+
+    /// For NGM `.sting` setup downloads, install straight from the CDN stream
+    /// without storing the `.pegNN` parts.  By default (without this switch)
+    /// the parts are downloaded to the target directory first, then extracted
+    /// from disk and deleted.
+    #[arg(long)]
+    pub streamed: bool,
 }
 
 /// Subcommands for different game platform operations.
@@ -257,6 +264,12 @@ pub enum Commands {
         /// Output results as JSON (for `--check`).
         #[arg(long)]
         json: bool,
+
+        /// Stream-install NGM `.sting` setups straight from the CDN without
+        /// storing the `.pegNN` parts.  Default: download the parts to the
+        /// target first, then extract and delete them.
+        #[arg(long)]
+        streamed: bool,
 
         /// Route all traffic through a proxy (value optional; empty = system
         /// proxy). See the top-level `--proxy` help for details.

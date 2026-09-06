@@ -46,6 +46,18 @@ pub const SIDECAR_NGM: SidecarKind = SidecarKind {
     ext: ".ngmdl",
 };
 
+/// PEG setup-part segment sidecar (`.nxdlseg`, magic `NXPEG`).
+///
+/// Used while a `.pegNN` part is downloaded in parallel byte-range segments
+/// (default non-streamed mode): one "object" per segment, so the bitmap says
+/// which of the part's byte ranges are already on disk.  Lives next to the
+/// staging file (e.g. `maplestory.peg00.part.nxdlseg`) and is deleted once
+/// the part is complete.
+pub const SIDECAR_PEG: SidecarKind = SidecarKind {
+    magic: *b"NXPEG",
+    ext: ".nxdlseg",
+};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------

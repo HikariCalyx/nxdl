@@ -1538,16 +1538,777 @@ fn download_setup_part(
     Err(last_err.unwrap_or_else(|| anyhow!("failed to download {url}")))
 }
 
+/// Number of byte-range segments each setup part is split into when it is
+/// downloaded in default (non-streamed) mode.
+const PART_SEGMENTS: usize = 5;
+
+/// How many setup parts are downloaded at once.  Every active part fetches its
+/// `PART_SEGMENTS` ranges on its own threads, so the total number of
+/// concurrent connections is `PART_SEGMENTS * PARTS_IN_PARALLEL` (= 10).
+const PARTS_IN_PARALLEL: usize = 2;
+
+/// Split `size` bytes into `segments` contiguous `(start, end)` ranges; the
+/// final range absorbs any remainder so the ranges exactly cover `[0, size)`
+/// with no gaps or overlaps.
+fn segment_ranges(size: u64, segments: usize) -> Vec<(u64, u64)> {
+    (0..segments)
+        .map(|i| {
+            (
+                size * i as u64 / segments as u64,
+                size * (i + 1) as u64 / segments as u64,
+            )
+        })
+        .collect()
+}
+
+/// Ask the server whether it honours byte ranges and, if so, the full size of
+/// `url`, using a tiny `Range: bytes=0-0` request.
+///
+/// Returns `Some(total_size)` when the server answers `206` (ranges work) and
+/// `None` when it answers `200` (the range header was ignored — the caller
+/// must fall back to a single sequential stream).
+fn probe_range_size(agent: &ureq::Agent, url: &str) -> Result<Option<u64>> {
+    let resp = agent
+        .get(url)
+        .set("Range", "bytes=0-0")
+        .call()
+        .with_context(|| format!("failed to probe {url}"))?;
+    match resp.status() {
+        206 => {
+            let cr = resp
+                .header("Content-Range")
+                .ok_or_else(|| anyhow!("206 response without Content-Range for {url}"))?;
+            let total = cr
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .ok_or_else(|| anyhow!("cannot parse Content-Range {cr:?} for {url}"))?;
+            Ok(Some(total))
+        }
+        200 => Ok(None),
+        status => bail!("unexpected HTTP status {status} while probing {url}"),
+    }
+}
+
+/// Download one whole setup part with a single sequential stream (the fallback
+/// when a part's size is unknown or the server does not support ranges).
+///
+/// Delegates to [`download_setup_part`] with a hidden worker bar (progress is
+/// folded into the overall `total_pb`).
+fn download_part_single(
+    agent: &ureq::Agent,
+    url: &str,
+    dest_path: &Path,
+    expected: Option<u64>,
+    total_pb: &ProgressBar,
+) -> Result<bool> {
+    let hidden = ProgressBar::new(0);
+    hidden.set_draw_target(ProgressDrawTarget::hidden());
+    download_setup_part(agent, url, dest_path, expected, &hidden, total_pb)
+}
+
+/// Download one setup part into `target_dir` (as `target_dir/<filename>`).
+///
+/// Prefers the segmented path: the part is split into [`PART_SEGMENTS`]
+/// byte-range requests that run concurrently (see [`download_part_segmented`]).
+/// Falls back to a single sequential stream when the exact size cannot be
+/// determined or the server ignores `Range`.  Returns `Ok(true)` when bytes
+/// were written, `Ok(false)` when the part was already present.
+fn download_one_part(
+    agent: &ureq::Agent,
+    part: &SetupPart,
+    target_dir: &Path,
+    total_pb: &ProgressBar,
+) -> Result<bool> {
+    let dest_path = target_dir.join(&part.filename);
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    // Already fully downloaded → skip (bytes counted so the total bar adds up),
+    // and clear any stray staging/sidecar files left next to it.
+    if let Some(expected) = part.size {
+        if expected > 0
+            && dest_path.exists()
+            && dest_path.metadata().map_or(false, |m| m.len() == expected)
+        {
+            let staged = part_path(&dest_path);
+            crate::resume::delete_progress(&staged, &crate::resume::SIDECAR_PEG);
+            let _ = std::fs::remove_file(&staged);
+            total_pb.inc(expected);
+            return Ok(false);
+        }
+    }
+
+    // Segmenting needs the exact size.  The manifest usually gives it (NFO) or
+    // a HEAD request resolved it (sting); probe as a last resort.
+    let size = match part.size {
+        Some(s) if s > 0 => s,
+        Some(_) => {
+            return download_part_single(agent, &part.url, &dest_path, Some(0), total_pb)
+        }
+        None => match probe_range_size(agent, &part.url)? {
+            Some(s) if s > 0 => s,
+            _ => {
+                return download_part_single(agent, &part.url, &dest_path, None, total_pb)
+            }
+        },
+    };
+
+    download_part_segmented(agent, &part.url, &dest_path, size, total_pb)
+}
+
+/// Download `size` bytes of `url` into `dest_path` (the final part name),
+/// splitting the file into [`PART_SEGMENTS`] contiguous byte ranges that are
+/// fetched concurrently.
+///
+/// Bytes are staged in `dest_path.part` (pre-allocated to `size`) with a
+/// `.nxdlseg` sidecar recording which ranges are already on disk, so an
+/// interrupted download resumes exactly the missing ranges.  When every range
+/// is written the staged file is renamed over `dest_path` and the sidecar is
+/// deleted.
+fn download_part_segmented(
+    agent: &ureq::Agent,
+    url: &str,
+    dest_path: &Path,
+    size: u64,
+    total_pb: &ProgressBar,
+) -> Result<bool> {
+    use std::sync::{Arc, Mutex};
+
+    let part_file = part_path(dest_path); // staging: `<name>.pegNN.part`
+    let sidecar = crate::resume::progress_path(&part_file, &crate::resume::SIDECAR_PEG);
+
+    // Contiguous `[start, end)` ranges, one per segment.
+    let ranges = segment_ranges(size, PART_SEGMENTS);
+
+    // Completion state carried over from a previous run's sidecar.
+    let mut done: Vec<bool> = vec![false; PART_SEGMENTS];
+    if let Some((bitmap, saved_objs, saved_size)) =
+        crate::resume::read_progress(&sidecar, &crate::resume::SIDECAR_PEG)
+    {
+        if saved_objs as usize == PART_SEGMENTS && saved_size == size {
+            done = bitmap.into_iter().map(|b| b != 0).collect();
+        } else {
+            // Stale sidecar (different segment count / size) → restart.
+            crate::resume::delete_progress(&part_file, &crate::resume::SIDECAR_PEG);
+            let _ = std::fs::remove_file(&part_file);
+        }
+    } else if part_file.exists() {
+        // No sidecar.  A full-size staging file means every range was already
+        // written and we only crashed before renaming — finish it now.
+        // Anything shorter is a stale leftover and is discarded.
+        if part_file.metadata().map_or(false, |m| m.len() == size) {
+            std::fs::rename(&part_file, dest_path).with_context(|| {
+                format!(
+                    "failed to move {} into place as {}",
+                    part_file.display(),
+                    dest_path.display()
+                )
+            })?;
+            total_pb.inc(size);
+            return Ok(true);
+        }
+        let _ = std::fs::remove_file(&part_file);
+    }
+
+    // Resuming but the staging file is gone / the wrong size → restart.
+    if done.iter().any(|&b| b)
+        && !(part_file.exists()
+            && part_file.metadata().map_or(false, |m| m.len() == size))
+    {
+        crate::resume::delete_progress(&part_file, &crate::resume::SIDECAR_PEG);
+        let _ = std::fs::remove_file(&part_file);
+        done = vec![false; PART_SEGMENTS];
+    }
+
+    // No completed ranges → build a fresh full-size staging file + sidecar.
+    if !done.iter().any(|&b| b) {
+        crate::resume::delete_progress(&part_file, &crate::resume::SIDECAR_PEG);
+        let _ = std::fs::remove_file(&part_file);
+        let file = std::fs::File::create(&part_file)
+            .with_context(|| format!("failed to create {}", part_file.display()))?;
+        file.set_len(size)
+            .with_context(|| format!("failed to size {}", part_file.display()))?;
+        crate::resume::create_progress(
+            &part_file,
+            PART_SEGMENTS as u32,
+            size,
+            &crate::resume::SIDECAR_PEG,
+        )
+        .with_context(|| format!("failed to create sidecar {}", sidecar.display()))?;
+    }
+
+    // Account for ranges already on disk so the overall bar reflects them now.
+    let resumed = done.iter().filter(|&&b| b).count();
+    for (i, &b) in done.iter().enumerate() {
+        if b {
+            let (s, e) = ranges[i];
+            total_pb.inc(e - s);
+        }
+    }
+    if resumed > 0 {
+        println!(
+            "  {}: resuming ({resumed}/{} ranges already on disk)",
+            dest_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dest_path.display().to_string()),
+            PART_SEGMENTS
+        );
+    }
+
+    // Fetch the missing ranges concurrently (one thread per range).
+    let mark = Arc::new(Mutex::new(()));
+    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for i in 0..PART_SEGMENTS {
+            if done[i] {
+                continue;
+            }
+            let (start, end) = ranges[i];
+            let agent = agent.clone();
+            let part_file = part_file.clone();
+            let pb = total_pb.clone();
+            let mark = Arc::clone(&mark);
+            handles.push(scope.spawn(move || {
+                fetch_range(&agent, url, start, end, &part_file, i, &pb, mark)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for r in results {
+        r.with_context(|| {
+            format!("failed to download ranges of {}", dest_path.display())
+        })?;
+    }
+
+    // Every range is on disk: drop the sidecar and move the part into place.
+    crate::resume::delete_progress(&part_file, &crate::resume::SIDECAR_PEG);
+    std::fs::rename(&part_file, dest_path).with_context(|| {
+        format!(
+            "failed to move {} into place as {}",
+            part_file.display(),
+            dest_path.display()
+        )
+    })?;
+    Ok(true)
+}
+
+/// Fetch one byte range `[start, end)` of `url` and write it into `part_file`
+/// at the same offset (the file is pre-allocated).  Once the whole range is on
+/// disk it is marked done in the part's sidecar (under `mark`, so concurrent
+/// writers do not clobber each other's sidecar updates).  Retries a few times
+/// on transient failures.
+fn fetch_range(
+    agent: &ureq::Agent,
+    url: &str,
+    start: u64,
+    end: u64,
+    part_file: &Path,
+    seg_index: usize,
+    total_pb: &ProgressBar,
+    mark: std::sync::Arc<std::sync::Mutex<()>>,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    if start == end {
+        return Ok(());
+    }
+    let want = end - start;
+    const ATTEMPTS: usize = 8;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for _ in 0..ATTEMPTS {
+        let resp = match agent
+            .get(url)
+            .set("Range", &format!("bytes={start}-{}", end - 1))
+            .call()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(anyhow!("HTTP request failed: {e}"));
+                continue;
+            }
+        };
+        match resp.status() {
+            206 => {}
+            200 => {
+                bail!(
+                    "server ignored the Range request for {url}; cannot fetch \
+                     segment {seg_index} of {start}-{end}"
+                );
+            }
+            status => {
+                bail!("unexpected HTTP status {status} for range {start}-{end} of {url}");
+            }
+        }
+
+        let mut file = match std::fs::OpenOptions::new().write(true).open(part_file) {
+            Ok(f) => f,
+            Err(e) => {
+                last_err = Some(e.into());
+                continue;
+            }
+        };
+        if let Err(e) = file.seek(SeekFrom::Start(start)) {
+            last_err = Some(e.into());
+            continue;
+        }
+        let mut reader = resp.into_reader();
+        let mut buf = [0u8; 256 * 1024];
+        let mut got: u64 = 0;
+        let mut failed = false;
+        while got < want {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // connection ended early
+                Ok(n) => {
+                    let take = ((want - got) as usize).min(n);
+                    if let Err(e) = file.write_all(&buf[..take]) {
+                        last_err = Some(e.into());
+                        failed = true;
+                        break;
+                    }
+                    got += take as u64;
+                    total_pb.inc(take as u64);
+                    if take < n {
+                        break; // server sent more than requested; we have it all
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(anyhow!("read error: {e}"));
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        drop(file);
+        if failed {
+            continue;
+        }
+        if got == want {
+            let _g = mark.lock().unwrap();
+            crate::resume::mark_done(part_file, seg_index as u32, &crate::resume::SIDECAR_PEG)?;
+            return Ok(());
+        }
+        last_err = Some(anyhow!("short read: got {got} of {want} bytes"));
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("failed to fetch segment {seg_index} of {url}")))
+}
+
+/// Download every part of a setup package into `target_dir`, showing an
+/// overall progress bar.  Parts are processed a few at a time
+/// ([`PARTS_IN_PARALLEL`]) and each part is split into [`PART_SEGMENTS`]
+/// concurrent byte-range downloads, so up to
+/// `PART_SEGMENTS * PARTS_IN_PARALLEL` (10) connections run at once.  An
+/// interrupted part resumes from the ranges already staged (`.part` +
+/// `.nxdlseg` sidecar).  Bails only if a part could not be fetched
+/// (already-present parts are reported as skipped).
+fn download_parts(
+    agent: &ureq::Agent,
+    parts: &[SetupPart],
+    target_dir: &Path,
+    total_size: u64,
+) -> Result<()> {
+    // ---- Progress bars (overall only; per-part lines go to stdout) ----
+    let mp = MultiProgress::new();
+    // Hide bars when stdout is not a terminal (piped / redirected).
+    if !std::io::stdout().is_terminal() {
+        mp.set_draw_target(ProgressDrawTarget::hidden());
+    }
+    let total_pb = mp.add(ProgressBar::new(total_size));
+    total_pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+             {bytes}/{total_bytes} ({binary_bytes_per_sec}, ETA {eta})",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    total_pb.enable_steady_tick(Duration::from_millis(120));
+
+    // Reflect overall progress on the OS taskbar / dock (cleared on drop).
+    let mut _taskbar = crate::taskprogress::watch(total_pb.clone(), total_size);
+
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+
+    let mut queue: &[SetupPart] = parts;
+    while !queue.is_empty() {
+        let batch = &queue[..queue.len().min(PARTS_IN_PARALLEL)];
+        queue = &queue[batch.len()..];
+
+        let results: Vec<Result<bool>> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for part in batch {
+                let agent = agent.clone();
+                let pb = total_pb.clone();
+                handles.push(scope.spawn(move || {
+                    download_one_part(&agent, part, target_dir, &pb)
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        for (r, part) in results.into_iter().zip(batch.iter()) {
+            match r {
+                Ok(true) => {
+                    downloaded += 1;
+                    println!("  {}: downloaded", part.filename);
+                }
+                Ok(false) => {
+                    skipped += 1;
+                    println!("  {}: already present", part.filename);
+                }
+                Err(e) => failures.push(format!("{}: {e:#}", part.filename)),
+            }
+        }
+    }
+
+    total_pb.finish_and_clear();
+    _taskbar.finish();
+
+    let failed = failures.len();
+    println!();
+    println!(
+        "Done: {downloaded} part(s) downloaded, {skipped} already present, \
+         {failed} failed."
+    );
+    if !failures.is_empty() {
+        for f in &failures {
+            println!("  {f}");
+        }
+        bail!("{failed} part(s) failed to download");
+    }
+    Ok(())
+}
+
+/// Name of the sub-folder (under the download target) that a `.sting` client
+/// is extracted into: the leading token of the sting's part base name
+/// (e.g. `MapleStoryM_2.430.6284_Live_1717` → `MapleStoryM`), falling back to
+/// `game`.
+fn sting_game_dir_name(package: &SetupPackage) -> String {
+    package
+        .sting
+        .as_ref()
+        .and_then(|s| s.sting_name.split('_').next())
+        .filter(|t| !t.is_empty())
+        .unwrap_or("game")
+        .to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// `.incomplete` install marker (pipelined default-mode `.sting` install)
+// ---------------------------------------------------------------------------
+
+/// Path of the `.incomplete` install marker for a `.sting` download:
+/// `target_dir/.incomplete`.  Its presence means the download/install is not
+/// finished yet; it lists, one PEG part file name per line, the parts that
+/// have already finished downloading AND installing.  It is removed once every
+/// part is done.
+fn incomplete_marker_path(target_dir: &Path) -> std::path::PathBuf {
+    target_dir.join(".incomplete")
+}
+
+/// Read the parts already fully installed from the `.incomplete` marker
+/// (empty when the marker is absent).
+fn read_installed_parts(marker: &Path) -> Vec<String> {
+    std::fs::read_to_string(marker)
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_owned())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Record `filename` as fully downloaded + installed by (re)writing the
+/// `.incomplete` marker with it included.  Concurrent calls must be
+/// serialised by the caller (workers share a mutex).
+fn mark_part_installed(marker: &Path, filename: &str) {
+    let mut names = read_installed_parts(marker);
+    if !names.iter().any(|n| n == filename) {
+        names.push(filename.to_owned());
+    }
+    if let Err(e) = std::fs::write(marker, names.join("\n") + "\n") {
+        eprintln!(
+            "warning: failed to write install marker {}: {e}",
+            marker.display()
+        );
+    }
+}
+
+/// Remove the `.incomplete` marker once every part is installed.
+fn clear_incomplete_marker(marker: &Path) {
+    let _ = std::fs::remove_file(marker);
+}
+
+/// True when `dir` exists and contains at least one entry.
+fn dir_has_entries(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|mut it| it.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Download one part (if its `.pegNN` is not already fully on disk), extract
+/// it into `game_dir`, then delete the part file.
+///
+/// Runs on a worker thread so its extraction overlaps other parts that are
+/// still downloading.  The part is recorded in the `.incomplete` marker (under
+/// `marker_lock`) only after extraction succeeds; if extraction fails the
+/// `.pegNN` file is left in place and not recorded, so a re-run only retries
+/// that part.
+fn install_one_part(
+    agent: &ureq::Agent,
+    part: &SetupPart,
+    target_dir: &Path,
+    game_dir: &Path,
+    marker: &Path,
+    marker_lock: &std::sync::Mutex<()>,
+    total_pb: &ProgressBar,
+) -> Result<crate::peg::PegStats> {
+    let dest = target_dir.join(&part.filename);
+
+    download_one_part(agent, part, target_dir, total_pb)
+        .with_context(|| format!("failed to download {}", part.filename))?;
+
+    let stats = crate::peg::extract_peg_local(&dest, game_dir, false)
+        .with_context(|| format!("failed to extract {}", part.filename))?;
+
+    // Record first, then reclaim the part file: if we crash in between, the
+    // part is already marked done (a leftover `.pegNN` is cleaned up at the
+    // end of the install).
+    {
+        let _g = marker_lock.lock().unwrap();
+        mark_part_installed(marker, &part.filename);
+    }
+    if let Err(e) = std::fs::remove_file(&dest) {
+        eprintln!("warning: failed to delete {}: {e}", dest.display());
+    }
+    Ok(stats)
+}
+
+/// Default (non-`--streamed`) `.sting` install: download the `.pegNN` parts
+/// into `target_dir` and extract each one into `target_dir/<game>` as soon as
+/// that part's download finishes, so extraction overlaps the parts that are
+/// still downloading (pipelined; up to [`PARTS_IN_PARALLEL`] parts download at
+/// once, each split into [`PART_SEGMENTS`] byte ranges).  Each part is
+/// verified (size + CRC-32) on extraction and its `.pegNN` file is deleted
+/// immediately afterwards.
+///
+/// Progress is recorded in a `target_dir/.incomplete` marker that lists which
+/// parts have finished download + install, so an interrupted run resumes only
+/// the parts that are not yet done (and a fully installed client is never
+/// re-downloaded).  The marker is removed once every part is done.
+fn download_then_extract_sting(
+    agent: &ureq::Agent,
+    target_dir: &Path,
+    package: &SetupPackage,
+) -> Result<()> {
+    let game_dir = target_dir.join(sting_game_dir_name(package));
+    let marker = incomplete_marker_path(target_dir);
+    let total = package.parts.len();
+
+    std::fs::create_dir_all(target_dir).with_context(|| {
+        format!(
+            "failed to create target directory {}",
+            target_dir.display()
+        )
+    })?;
+
+    let installed = read_installed_parts(&marker);
+
+    // No marker at all → either the client was fully installed earlier (the
+    // marker is removed on completion) or this is a fresh start.
+    if installed.is_empty() && !marker.exists() {
+        if dir_has_entries(&game_dir) {
+            println!();
+            println!(
+                "{} already contains an installed game (no `.incomplete` \
+                 marker present). Delete it to reinstall.",
+                game_dir.display()
+            );
+            return Ok(());
+        }
+    }
+
+    // Only the parts not yet marked as fully installed need work.
+    let pending: Vec<&SetupPart> = package
+        .parts
+        .iter()
+        .filter(|p| !installed.iter().any(|n| n == &p.filename))
+        .collect();
+
+    if pending.is_empty() {
+        clear_incomplete_marker(&marker);
+        println!();
+        println!(
+            "Already installed into {} ({total} part(s)).",
+            game_dir.display()
+        );
+        return Ok(());
+    }
+
+    let resumed = installed.len();
+    let count = pending.len();
+    let pending_size: u64 = pending.iter().filter_map(|p| p.size).sum();
+
+    println!();
+    if resumed > 0 {
+        println!(
+            "Resuming: {resumed}/{total} part(s) already downloaded and installed."
+        );
+    }
+    println!(
+        "Downloading and installing {count} .peg part(s) into {} ...",
+        target_dir.display()
+    );
+
+    // Overall progress bar for the bytes still to be downloaded.
+    let mp = MultiProgress::new();
+    if !std::io::stdout().is_terminal() {
+        mp.set_draw_target(ProgressDrawTarget::hidden());
+    }
+    let total_pb = mp.add(ProgressBar::new(pending_size));
+    total_pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
+             {bytes}/{total_bytes} ({binary_bytes_per_sec}, ETA {eta})",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+    total_pb.enable_steady_tick(Duration::from_millis(120));
+    let mut _taskbar = crate::taskprogress::watch(total_pb.clone(), pending_size);
+
+    let marker_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let mut total_files = 0u64;
+    let mut total_dirs = 0u64;
+    let mut total_bytes = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+
+    // References (Copy) so the per-part worker closures can share them without
+    // moving the owning PathBufs into the first spawned thread.
+    let marker_ref: &Path = &marker;
+    let game_dir_ref: &Path = &game_dir;
+
+    // Process pending parts in small batches: each worker downloads its part
+    // (5 parallel ranges), then extracts + deletes it — overlapping with the
+    // sibling part that is still downloading.
+    let mut queue: &[&SetupPart] = &pending;
+    while !queue.is_empty() {
+        let batch = &queue[..queue.len().min(PARTS_IN_PARALLEL)];
+        queue = &queue[batch.len()..];
+
+        let outcomes: Vec<(String, Result<crate::peg::PegStats>)> =
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for part in batch.iter().copied() {
+                    let agent = agent.clone();
+                    let pb = total_pb.clone();
+                    let lock = std::sync::Arc::clone(&marker_lock);
+                    handles.push(scope.spawn(move || {
+                        let r = install_one_part(
+                            &agent,
+                            part,
+                            target_dir,
+                            game_dir_ref,
+                            marker_ref,
+                            &lock,
+                            &pb,
+                        );
+                        (part.filename.clone(), r)
+                    }));
+                }
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+        for (filename, result) in outcomes {
+            match result {
+                Ok(stats) => {
+                    total_files += stats.files;
+                    total_dirs += stats.dirs;
+                    total_bytes += stats.uncompressed_bytes;
+                    let skipped = if stats.skipped_files > 0 {
+                        format!(", {} skipped (CRC ok)", stats.skipped_files)
+                    } else {
+                        String::new()
+                    };
+                    println!(
+                        "  {filename}: {} file(s){}, {} dir(s), {:.2} GiB \
+                         decompressed; part deleted",
+                        stats.files,
+                        skipped,
+                        stats.dirs,
+                        stats.uncompressed_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    );
+                }
+                Err(e) => failures.push(format!("{filename}: {e:#}")),
+            }
+        }
+    }
+
+    total_pb.finish_and_clear();
+    _taskbar.finish();
+
+    println!();
+    if !failures.is_empty() {
+        println!("Failed parts (kept on disk for retry):");
+        for f in &failures {
+            println!("  {f}");
+        }
+        println!(
+            "Note: fully installed parts are recorded in {}; re-run to finish \
+             the remaining part(s).",
+            marker.display()
+        );
+        bail!("{} part(s) failed to install", failures.len());
+    }
+
+    // Everything is installed: drop the marker and clean any stray `.pegNN`
+    // that a crash may have left behind after a part was recorded.
+    clear_incomplete_marker(&marker);
+    for part in &package.parts {
+        let _ = std::fs::remove_file(target_dir.join(&part.filename));
+    }
+
+    println!(
+        "Installed {} file(s) in {} dir(s) ({} bytes decompressed) into {}",
+        total_files,
+        total_dirs,
+        format_bytes(total_bytes),
+        game_dir.display()
+    );
+    println!(
+        "All file CRC-32 checks passed; each .peg part was deleted as soon as \
+         it was extracted."
+    );
+    Ok(())
+}
+
 /// Download a setup-package client (no `manifest_name`): fetch the
 /// `.sting`/`.nfo` manifest from `setup_file_url` and install the client into
-/// `target_dir`.  `.sting` PEG packages are stream-downloaded and extracted in
-/// one pass (no `.pegNN` part file kept on disk); `.nfo` split archives are
-/// downloaded first (their extraction is not implemented yet).
+/// `target_dir`.
+///
+/// `.sting` PEG packages install two ways:
+/// - default (`streamed == false`): download the `.pegNN` parts into
+///   `target_dir`, extract them into a sub-folder of it, then delete the
+///   parts;
+/// - `--streamed`: download + extract in one pass from the CDN (no part file
+///   kept on disk).
+///
+/// `.nfo` split archives are downloaded first (their extraction is not
+/// implemented yet).
 fn download_ngm_setup(
     appid: &str,
     target_dir: &Path,
     info: &GameInfo,
     agent: &ureq::Agent,
+    streamed: bool,
 ) -> Result<()> {
     let mut package = fetch_setup_package(agent, &info.setup_file_url)?;
 
@@ -1592,84 +2353,24 @@ fn download_ngm_setup(
         )
     })?;
 
-    // `.sting` packages install straight from the CDN stream: each `.pegNN`
-    // part is downloaded and extracted in one pass, verifying CRC-32 as it
-    // goes, so the part is never stored on disk.
+    // `.sting` packages: with `--streamed` they install straight from the CDN
+    // stream (no part kept on disk); by default the `.pegNN` parts are
+    // downloaded into `target_dir` first, then extracted from disk and deleted.
     if package.format == "sting" {
-        return stream_extract_sting(agent, target_dir, &package);
-    }
-
-    // `.nfo` packages are downloaded as `.zNN` split archives first.
-    // ---- Progress bars ----
-    let mp = MultiProgress::new();
-    // Hide bars when stdout is not a terminal (piped / redirected).
-    if !std::io::stdout().is_terminal() {
-        mp.set_draw_target(ProgressDrawTarget::hidden());
-    }
-    let total_pb = mp.add(ProgressBar::new(total_size));
-    total_pb.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] \
-             {bytes}/{total_bytes} ({binary_bytes_per_sec}, ETA {eta})",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
-    total_pb.enable_steady_tick(Duration::from_millis(120));
-
-    // Reflect overall progress on the OS taskbar / dock (cleared on drop).
-    let mut _taskbar = crate::taskprogress::watch(total_pb.clone(), total_size);
-
-    let worker_pb = mp.add(ProgressBar::new(0));
-    worker_pb.set_style(
-        ProgressStyle::with_template(
-            "  [{bar:25.green/white}] {bytes:>10}/{total_bytes:>10} \
-             ({binary_bytes_per_sec:>11}) {wide_msg}",
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
-    worker_pb.enable_steady_tick(Duration::from_millis(120));
-
-    let mut downloaded = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-
-    for part in &package.parts {
-        let dest_path = target_dir.join(&part.filename);
-        match download_setup_part(
-            agent,
-            &part.url,
-            &dest_path,
-            part.size,
-            &worker_pb,
-            &total_pb,
-        ) {
-            Ok(true) => downloaded += 1,
-            Ok(false) => skipped += 1,
-            Err(e) => {
-                failed += 1;
-                failures.push(format!("{}: {:#}", part.filename, e));
-            }
+        if streamed {
+            return stream_extract_sting(agent, target_dir, &package);
         }
+        return download_then_extract_sting(agent, target_dir, &package);
     }
 
-    worker_pb.finish_and_clear();
-    total_pb.finish_and_clear();
-    _taskbar.finish();
-
-    println!();
+    // `.nfo` packages are downloaded as `.zNN` split archives (their
+    // extraction is not implemented yet).
     println!(
-        "Done: {downloaded} part(s) downloaded, {skipped} already present, \
-         {failed} failed."
+        "Downloading {} archive(s) into {} ...",
+        archive_count,
+        target_dir.display()
     );
-    if !failures.is_empty() {
-        for f in &failures {
-            println!("  {f}");
-        }
-        bail!("{} part(s) failed to download", failures.len());
-    }
+    download_parts(agent, &package.parts, target_dir, total_size)?;
     println!("Downloaded setup archives to: {}", target_dir.display());
     println!(
         "note: extracting the downloaded `.nfo` archives into the game tree \
@@ -2234,6 +2935,7 @@ pub fn download_ngm(
     filter: Option<&FileFilter>,
     allow_insecure: bool,
     proxy: Option<&str>,
+    streamed: bool,
 ) -> Result<()> {
     // ---- Step 1: fetch game info ----
     let agent = agent(allow_insecure, proxy);
@@ -2242,7 +2944,7 @@ pub fn download_ngm(
     // No `manifest_name`: the game is distributed as a setup package whose
     // `.sting` / `.nfo` manifest sits at `setup_file_url`.  Download its parts.
     if info.manifest_name.is_none() {
-        return download_ngm_setup(appid, target_dir, &info, &agent);
+        return download_ngm_setup(appid, target_dir, &info, &agent, streamed);
     }
 
     // ---- Step 2: download & parse the per-file patch manifest ----
@@ -3281,6 +3983,64 @@ mod tests {
             url_base_dir("http://webdown2.nexon.co.jp/mabinogi/inst/Mabinogi.nfo"),
             "http://webdown2.nexon.co.jp/mabinogi/inst"
         );
+    }
+
+    #[test]
+    fn segment_ranges_cover_the_whole_size_exactly() {
+        // Exact multiples split evenly.
+        assert_eq!(
+            segment_ranges(100, 5),
+            vec![(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]
+        );
+        // A remainder is absorbed by the final range, with no gaps or overlaps.
+        let ranges = segment_ranges(103, 5);
+        assert_eq!(ranges.len(), 5);
+        assert_eq!(ranges.first(), Some(&(0, 20)));
+        let mut pos = 0u64;
+        for &(s, e) in &ranges {
+            assert_eq!(s, pos, "range must start where the previous ended");
+            assert!(e > s, "empty range: {s}-{e}");
+            pos = e;
+        }
+        assert_eq!(pos, 103);
+        assert_eq!(ranges.last(), Some(&(82, 103)));
+
+        // Tiny files still split cleanly into 5 non-empty ranges only when
+        // the file is big enough; a 1-byte file leaves 4 empty ranges.
+        let ranges = segment_ranges(1, 5);
+        assert_eq!(ranges[0], (0, 0));
+        assert_eq!(ranges[4], (0, 1));
+    }
+
+    #[test]
+    fn incomplete_marker_round_trips() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("nxdl-incomplete-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join(".incomplete");
+
+        // No marker → no installed parts; an empty dir has no entries.
+        assert!(read_installed_parts(&marker).is_empty());
+        assert!(!dir_has_entries(&dir));
+
+        // Marking is idempotent and appends distinct parts.
+        mark_part_installed(&marker, "maplestory.peg00");
+        mark_part_installed(&marker, "maplestory.peg00");
+        mark_part_installed(&marker, "maplestory.peg01");
+        assert_eq!(
+            read_installed_parts(&marker),
+            ["maplestory.peg00", "maplestory.peg01"]
+        );
+        assert!(marker.exists());
+        assert!(dir_has_entries(&dir)); // now contains the marker
+
+        // Clearing removes the marker; reads become empty again.
+        clear_incomplete_marker(&marker);
+        assert!(read_installed_parts(&marker).is_empty());
+        assert!(!marker.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
