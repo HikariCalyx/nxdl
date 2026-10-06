@@ -12,7 +12,7 @@ pub struct Cli {
     /// Target game platform or alias.
     /// When --appid is not provided, the game name is looked up in the alias table.
     /// Applicable aliases: 
-    /// gms, gms_pts, gms_cw, gmb, vin_gl,
+    /// gms, gms_pts, gms_cw, gms_cw_pts, gmb, vin_gl,
     /// jms, msn, jmb, kmb, kmbt, tales_jp,
     /// tms_cw.
     #[arg(value_name = "GAME")]
@@ -334,7 +334,8 @@ const NXL_ALIASES: &[(&str, &str)] = &[
     ("gms_pts", "40600"),
     ("tmh", "50220"),
     ("tkr", "59814"),
-    ("gms_cw", "59822"),
+    ("gms_cw", "59813"),
+    ("gms_cw_pts", "59822"),
 ];
 
 /// Known appid aliases for NGM games (case-insensitive).
