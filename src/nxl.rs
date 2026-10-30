@@ -286,6 +286,8 @@ struct ResolvedFile {
     fsize: u64,
     objects: Vec<String>,
     objects_fsize: Vec<u64>,
+    /// Identity of `objects` in the manifest (see [`crate::resume::objects_id`]).
+    objects_id: String,
 }
 
 /// Download a complete NXL client given a `.manifest.hash` URL (or a raw SHA-1
@@ -375,11 +377,40 @@ pub fn download_client(
             fsize: file_info.fsize,
             objects: file_info.objects.clone(),
             objects_fsize: file_info.objects_fsize.clone(),
+            objects_id: crate::resume::objects_id(&file_info.objects),
         });
     }
 
+    // Step 4: drop files a previous run already finished.  A completed file has
+    // no sidecar left behind (it is deleted on success), so the downloaded log
+    // is the only record that lets a resumed run avoid fetching it again.
+    let completed_log =
+        crate::resume::CompletedLog::open(patchdata_dir.join(format!("{appid}.downloaded")));
+    let mut skipped_files = 0usize;
+    let mut skipped_bytes = 0u64;
+    entries.retain(|entry| {
+        if !completed_log.is_complete(&entry.rel_path, entry.fsize, &entry.objects_id) {
+            return true;
+        }
+        let dest_path = crate::relpath::join(&appdata_dir, &entry.rel_path);
+        if !dest_path.metadata().map_or(false, |m| m.len() == entry.fsize) {
+            return true;
+        }
+        skipped_files += 1;
+        skipped_bytes += entry.fsize;
+        // A crashed run may have left a sidecar behind; it is now redundant.
+        crate::resume::delete_progress(&dest_path, &crate::resume::SIDECAR_NXL);
+        false
+    });
+
     let file_count = entries.len();
     let download_bytes: u64 = entries.iter().map(|e| e.fsize).sum();
+    if skipped_files > 0 {
+        println!(
+            "Skipping {skipped_files} file(s) ({:.2} GiB) already downloaded by a previous run.",
+            skipped_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
     println!(
         "After filtering: {file_count} file(s) to download, {dirs_created} directories, \
          {filtered_out} filtered out ({failed_decode} path errors)."
@@ -432,6 +463,7 @@ pub fn download_client(
     // ---- Shared state ----
     let counter = AtomicUsize::new(0);
     let downloaded = AtomicUsize::new(0);
+    let verified = AtomicUsize::new(0);
     let failed_count = AtomicUsize::new(0);
     let bytes_downloaded = AtomicU64::new(0);
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -443,6 +475,7 @@ pub fn download_client(
         let entries = &entries;
         let counter = &counter;
         let downloaded = &downloaded;
+        let verified = &verified;
         let failed_count = &failed_count;
         let bytes_downloaded = &bytes_downloaded;
         let failures = &failures;
@@ -450,6 +483,7 @@ pub fn download_client(
         let agent = &agent;
         let appdata_dir = &appdata_dir;
         let base_url = base_url.as_str();
+        let completed_log = &completed_log;
 
         for bar in worker_bars.iter().cloned() {
             scope.spawn(move || {
@@ -475,11 +509,16 @@ pub fn download_client(
                         &entry.objects_fsize,
                         entry.fsize,
                         &dest_path,
+                        completed_log,
                         &bar,
                         total_pb,
                     ) {
-                        Ok(()) => {
-                            downloaded.fetch_add(1, Ordering::Relaxed);
+                        Ok(already_present) => {
+                            if already_present {
+                                verified.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                downloaded.fetch_add(1, Ordering::Relaxed);
+                            }
                             bytes_downloaded.fetch_add(entry.fsize, Ordering::Relaxed);
                         }
                         Err(e) => {
@@ -497,11 +536,18 @@ pub fn download_client(
     _taskbar.finish();
 
     let downloaded = downloaded.load(Ordering::Relaxed);
+    let verified = verified.load(Ordering::Relaxed);
     let failed = failed_count.load(Ordering::Relaxed);
 
     println!();
+    let already_present = skipped_files + verified;
+    let skipped_note = if already_present > 0 {
+        format!(", {already_present} already downloaded")
+    } else {
+        String::new()
+    };
     println!(
-        "Done: {downloaded} downloaded, {dirs_created} directories, \
+        "Done: {downloaded} downloaded{skipped_note}, {dirs_created} directories, \
          {filtered_out} filtered out, {failed} failed ({failed_decode} path errors)."
     );
 
@@ -562,25 +608,96 @@ fn block_layout(objects_fsize: &[u64], total_fsize: u64) -> (Vec<u64>, Vec<u64>)
     }
 }
 
+/// Record a finished file in the completed log so later runs can skip it.
+///
+/// Failing to write the log only costs a re-download next time, so it must not
+/// fail the download itself.
+fn record_complete(
+    completed_log: &crate::resume::CompletedLog,
+    rel_path: &str,
+    fsize: u64,
+    objects_id: &str,
+    worker_bar: &ProgressBar,
+) {
+    if let Err(e) = completed_log.record(rel_path, fsize, objects_id) {
+        worker_bar.println(format!(
+            "warning: failed to record {rel_path} as downloaded: {e}"
+        ));
+    }
+}
+
+/// Verify an existing file against the manifest's object hashes.
+///
+/// `object_id` is the SHA-1 of the *uncompressed* block, so a file written by a
+/// previous run (or by `--patch`) can be adopted instead of downloaded again.
+/// The file is read once, block by block; any mismatch rejects it.
+fn verify_existing_file(
+    dest_path: &Path,
+    objects: &[String],
+    block_sizes: &[u64],
+    offsets: &[u64],
+    total_fsize: u64,
+) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if objects.len() != block_sizes.len() || offsets.len() != block_sizes.len() {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(dest_path) else {
+        return false;
+    };
+    if file.metadata().map_or(true, |m| m.len() != total_fsize) {
+        return false;
+    }
+
+    let mut buf = vec![0u8; 256 * 1024];
+    for (i, size) in block_sizes.iter().enumerate() {
+        if file.seek(SeekFrom::Start(offsets[i])).is_err() {
+            return false;
+        }
+        let mut hasher = Sha1::new();
+        let mut remaining = *size;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            if file.read_exact(&mut buf[..want]).is_err() {
+                return false;
+            }
+            hasher.update(&buf[..want]);
+            remaining -= want as u64;
+        }
+        if !hex::encode(hasher.finalize()).eq_ignore_ascii_case(&objects[i]) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Download all object blocks for one file, concatenate them, and write to
 /// `dest_path`.  Objects are fetched with up to [`PARALLEL_OBJECTS`] concurrent
 /// requests.
 ///
 /// Supports resumption via a `.nxldl` sidecar file.  If a valid sidecar exists
 /// and the partial file on disk has the expected size, already-completed
-/// objects are skipped.
+/// objects are skipped.  A finished file is recorded in `completed_log` so a
+/// later run skips it entirely; a file that is already complete on disk but was
+/// downloaded before the log existed is verified against the manifest and
+/// adopted.
+///
+/// Returns `true` when nothing had to be downloaded because the file on disk
+/// was already complete.
 fn download_one_file(
     agent: &ureq::Agent,
     base_url: &str,
     appid: &str,
-    _rel_path: &str,
+    rel_path: &str,
     objects: &[String],
     objects_fsize: &[u64],
     total_fsize: u64,
     dest_path: &Path,
+    completed_log: &crate::resume::CompletedLog,
     worker_bar: &ProgressBar,
     total_bar: &ProgressBar,
-) -> Result<()> {
+) -> Result<bool> {
     use std::io::{Seek, SeekFrom, Write};
 
     // Ensure parent directory exists.
@@ -590,6 +707,7 @@ fn download_one_file(
     }
 
     let num_objects = objects.len();
+    let objects_id = crate::resume::objects_id(objects);
     let progress_path = crate::resume::progress_path(dest_path, &crate::resume::SIDECAR_NXL);
 
     // Resolve the uncompressed size and write offset of each block. `objects_fsize`
@@ -639,6 +757,21 @@ fn download_one_file(
 
     let is_resuming = completed_mask.iter().any(|&b| b);
 
+    // Adopt a file that is already complete on disk but has no sidecar: it was
+    // downloaded before the completed log existed, or by `--patch`.  Only the
+    // object hashes can prove that, since a crashed run can leave a
+    // pre-allocated file of exactly the right size.
+    if !is_resuming
+        && verify_existing_file(dest_path, objects, &block_sizes, &offsets, total_fsize)
+    {
+        crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
+        record_complete(completed_log, rel_path, total_fsize, &objects_id, worker_bar);
+        worker_bar.println(format!("verified existing {}", dest_path.display()));
+        worker_bar.inc(total_fsize);
+        total_bar.inc(total_fsize);
+        return Ok(true);
+    }
+
     // --- Pre-allocate / open the destination file ---
     if !is_resuming {
         let file = std::fs::File::create(dest_path)
@@ -657,7 +790,8 @@ fn download_one_file(
     if pending.is_empty() {
         // All objects already done — just clean up.
         crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
-        return Ok(());
+        record_complete(completed_log, rel_path, total_fsize, &objects_id, worker_bar);
+        return Ok(false);
     }
 
     if num_objects == 1 && !is_resuming {
@@ -674,9 +808,10 @@ fn download_one_file(
         std::fs::write(dest_path, &data)
             .with_context(|| format!("failed to write {}", dest_path.display()))?;
         crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
+        record_complete(completed_log, rel_path, total_fsize, &objects_id, worker_bar);
         worker_bar.inc(total_fsize);
         total_bar.inc(total_fsize);
-        return Ok(());
+        return Ok(false);
     }
 
     // --- Download pending objects in parallel batches ---
@@ -770,8 +905,9 @@ fn download_one_file(
 
     // All objects downloaded — clean up the sidecar.
     crate::resume::delete_progress(dest_path, &crate::resume::SIDECAR_NXL);
+    record_complete(completed_log, rel_path, total_fsize, &objects_id, worker_bar);
 
-    Ok(())
+    Ok(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,4 +1145,66 @@ fn format_bytes(bytes: u64) -> String {
         result.push(ch);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("nxdl-nxl-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Two blocks of `[10, 5]` bytes plus the object ids that describe them.
+    fn sample(tag: &str) -> (std::path::PathBuf, Vec<String>, Vec<u64>, Vec<u64>, u64) {
+        let root = temp_dir(tag);
+        let dest = root.join("file.bin");
+        let blocks = [vec![b'a'; 10], vec![b'b'; 5]];
+        let mut data = Vec::new();
+        let mut objects = Vec::new();
+        let mut offsets = Vec::new();
+        for block in &blocks {
+            offsets.push(data.len() as u64);
+            data.extend_from_slice(block);
+            objects.push(hex::encode(Sha1::digest(block)));
+        }
+        std::fs::write(&dest, &data).unwrap();
+        let sizes: Vec<u64> = blocks.iter().map(|b| b.len() as u64).collect();
+        (dest, objects, sizes, offsets, data.len() as u64)
+    }
+
+    #[test]
+    fn verify_existing_file_accepts_matching_blocks() {
+        let (dest, objects, sizes, offsets, total) = sample("ok");
+        assert!(verify_existing_file(&dest, &objects, &sizes, &offsets, total));
+    }
+
+    #[test]
+    fn verify_existing_file_rejects_corrupt_data() {
+        let (dest, objects, sizes, offsets, total) = sample("corrupt");
+        let mut data = std::fs::read(&dest).unwrap();
+        data[12] ^= 0xFF; // inside the second block
+        std::fs::write(&dest, &data).unwrap();
+        assert!(!verify_existing_file(&dest, &objects, &sizes, &offsets, total));
+    }
+
+    #[test]
+    fn verify_existing_file_rejects_preallocated_files() {
+        // A crashed run can leave a file of exactly the right size, all zeros.
+        let (dest, objects, sizes, offsets, total) = sample("zeros");
+        std::fs::write(&dest, vec![0u8; total as usize]).unwrap();
+        assert!(!verify_existing_file(&dest, &objects, &sizes, &offsets, total));
+    }
+
+    #[test]
+    fn verify_existing_file_rejects_size_mismatch_and_bad_lists() {
+        let (dest, objects, sizes, offsets, total) = sample("mismatch");
+        assert!(!verify_existing_file(&dest, &objects, &sizes, &offsets, total + 1));
+        assert!(!verify_existing_file(&dest, &objects[..1], &sizes, &offsets, total));
+        assert!(!verify_existing_file(&dest.join("missing"), &objects, &sizes, &offsets, total));
+    }
 }

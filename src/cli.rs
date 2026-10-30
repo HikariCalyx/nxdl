@@ -153,6 +153,11 @@ pub enum Commands {
         /// manifest. With one value (`<TARGET_PATH>`), the public manifest is
         /// resolved automatically from the branch API using the login session
         /// saved in `nxl.ini` (run `--login` first).
+        ///
+        /// Interrupted downloads resume automatically: objects already written
+        /// are skipped, and a file already present on disk is verified against
+        /// the manifest's object hashes instead of being downloaded again (see
+        /// `<TARGET_PATH>/patchdata/<APPID>.downloaded`).
         #[arg(long, value_names = ["MANIFEST_URL", "TARGET_PATH"], num_args = 1..=2)]
         download: Option<Vec<String>>,
 
